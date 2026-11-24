@@ -1,0 +1,48 @@
+# Build artifacts & CMake output
+build/
+build-*/
+out/
+CMakeUserPresets.json
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+*.pdb
+*.ilk
+*.exp
+*.obj
+*.log
+*.tmp
+
+# Third-party downloaded SDKs / clones (keep ASIO README only)
+third_party/NeuralAmpModelerCore/
+third_party/eigen/
+third_party/asiosdk/*
+!third_party/asiosdk/README.txt
+
+# Reference documents & untouched external folders
+Setup 5.10.1/
+*.pdf
+*.xlsx
+*.zip
+
+# User audio captures, presets & runtime settings
+*.nam
+*.pbpreset
+*.settings
+
+# Python helper cache (tools/)
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+desktop.ini
+compile_commands.json
+.vscode/
+.idea/
+.cache/
+.clangd/
