@@ -21,6 +21,10 @@ third_party/eigen/
 third_party/asiosdk/*
 !third_party/asiosdk/README.txt
 
+# Local bundled ModelPacks (.nam & .wav IRs placed locally for personal build; keep README only)
+assets/modelpacks/*
+!assets/modelpacks/README.txt
+
 # Reference documents & untouched external folders
 Setup 5.10.1/
 *.pdf

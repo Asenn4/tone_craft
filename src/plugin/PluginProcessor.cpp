@@ -194,6 +194,7 @@ ChainParams PedalBoardAudioProcessor::readCurrentParams() const noexcept {
     p.inputPhaseInvert    = inputPhaseInvert.load(std::memory_order_relaxed);
     p.inputRumbleHpfHz    = inputRumbleHpfHz.load(std::memory_order_relaxed);
     p.outputSafetyLimiter = outputSafetyLimiter.load(std::memory_order_relaxed);
+    p.tempoBpm            = effectiveBpm.load(std::memory_order_relaxed);
     p.looperLevelDb = pLooperLevel->load(std::memory_order_relaxed);
     p.looperPreFx   = pLooperPreFx->load(std::memory_order_relaxed) > 0.5f;
 
@@ -223,6 +224,7 @@ ChainParams PedalBoardAudioProcessor::readCurrentParams() const noexcept {
     p.compressor.attackMs    = pCompAttack->load(std::memory_order_relaxed);
     p.compressor.releaseMs   = pCompRelease->load(std::memory_order_relaxed);
     p.compressor.makeupDb    = pCompMakeup->load(std::memory_order_relaxed);
+    p.compressor.tempoBpm    = p.tempoBpm;
 
     p.wah.bypass      = pWahBypass->load(std::memory_order_relaxed) > 0.5f;
     p.wah.modelIndex  = static_cast<int>(std::lround(pWahModel->load(std::memory_order_relaxed)));
@@ -305,6 +307,7 @@ ChainParams PedalBoardAudioProcessor::readCurrentParams() const noexcept {
     p.chorus.depth      = pChorusDepth->load(std::memory_order_relaxed);
     p.chorus.delayMs    = pChorusDelay->load(std::memory_order_relaxed);
     p.chorus.mix        = pChorusMix->load(std::memory_order_relaxed);
+    p.chorus.tempoBpm   = p.tempoBpm;
 
     p.delay.bypass     = pDelayBypass->load(std::memory_order_relaxed) > 0.5f;
     p.delay.modelIndex = static_cast<int>(std::lround(pDelayModel->load(std::memory_order_relaxed)));
@@ -312,6 +315,7 @@ ChainParams PedalBoardAudioProcessor::readCurrentParams() const noexcept {
     p.delay.feedback   = pDelayFeedback->load(std::memory_order_relaxed);
     p.delay.mix        = pDelayMix->load(std::memory_order_relaxed);
     p.delay.pingPong   = pDelayPingPong->load(std::memory_order_relaxed) > 0.5f;
+    p.delay.tempoBpm   = p.tempoBpm;
 
     p.reverb.bypass     = pReverbBypass->load(std::memory_order_relaxed) > 0.5f;
     p.reverb.modelIndex = static_cast<int>(std::lround(pReverbModel->load(std::memory_order_relaxed)));
@@ -399,6 +403,22 @@ void PedalBoardAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, ju
             lastMidiTimestampMs.store(static_cast<int64_t>(juce::Time::getMillisecondCounterHiRes()), std::memory_order_release);
         }
     }
+
+    // Read live tempo BPM from Host DAW PlayHead in VST3, falling back to Master/Tap BPM in Standalone
+    float activeBpm = manualBpm.load(std::memory_order_relaxed);
+    bool fromHost = false;
+    if (auto* ph = getPlayHead()) {
+        if (const auto pos = ph->getPosition()) {
+            if (const auto hostBpm = pos->getBpm()) {
+                if (*hostBpm >= 30.0 && *hostBpm <= 300.0) {
+                    activeBpm = static_cast<float>(*hostBpm);
+                    fromHost = true;
+                }
+            }
+        }
+    }
+    effectiveBpm.store(activeBpm, std::memory_order_relaxed);
+    hostTempoSynced.store(fromHost, std::memory_order_relaxed);
 
     const auto chainParams = readCurrentParams();
     signalChain.process(buffer, chainParams);
@@ -1163,6 +1183,11 @@ void PedalBoardAudioProcessor::loadStudioSettings() {
         if (obj->hasProperty("expressionPedalCc")) {
             expressionPedalCc.store(std::clamp(static_cast<int>(obj->getProperty("expressionPedalCc")), 0, 127), std::memory_order_release);
         }
+        if (obj->hasProperty("manualBpm")) {
+            const float bpm = std::clamp(static_cast<float>(static_cast<double>(obj->getProperty("manualBpm"))), 40.0f, 240.0f);
+            manualBpm.store(bpm, std::memory_order_relaxed);
+            effectiveBpm.store(bpm, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -1176,6 +1201,7 @@ void PedalBoardAudioProcessor::saveStudioSettings() const {
     obj->setProperty("tunerReferenceHz", static_cast<double>(getTunerReferenceHz()));
     obj->setProperty("midiProgramChangeEnabled", isMidiProgramChangeEnabled());
     obj->setProperty("expressionPedalCc", getExpressionPedalCc());
+    obj->setProperty("manualBpm", static_cast<double>(getManualBpm()));
     getStudioSettingsFile().replaceWithText(juce::JSON::toString(juce::var(obj), true));
 }
 
@@ -1223,6 +1249,46 @@ void PedalBoardAudioProcessor::setMidiProgramChangeEnabled(bool enabled) {
     notifyUiStateChanged();
 }
 
+void PedalBoardAudioProcessor::setManualBpm(float bpm) {
+    const float clamped = std::clamp(std::round(bpm * 2.0f) * 0.5f, 40.0f, 240.0f);
+    manualBpm.store(clamped, std::memory_order_relaxed);
+    if (!hostTempoSynced.load(std::memory_order_relaxed)) {
+        effectiveBpm.store(clamped, std::memory_order_relaxed);
+    }
+    saveStudioSettings();
+    notifyUiStateChanged();
+}
+
+void PedalBoardAudioProcessor::triggerTapTempo() {
+    const double nowSec = juce::Time::getMillisecondCounterHiRes() * 0.001;
+    lastTapTempoMs.store(static_cast<int64_t>(nowSec * 1000.0), std::memory_order_relaxed);
+
+    if (lastTapTimeSec > 0.0) {
+        const double delta = nowSec - lastTapTimeSec;
+        if (delta > 2.2 || delta < 0.18) {
+            tapCount = 0;
+        } else {
+            if (tapCount < static_cast<int>(tapIntervalsSec.size())) {
+                tapIntervalsSec[static_cast<size_t>(tapCount++)] = delta;
+            } else {
+                for (size_t i = 0; i + 1 < tapIntervalsSec.size(); ++i) {
+                    tapIntervalsSec[i] = tapIntervalsSec[i + 1];
+                }
+                tapIntervalsSec.back() = delta;
+            }
+            double sum = 0.0;
+            for (int i = 0; i < tapCount; ++i) {
+                sum += tapIntervalsSec[static_cast<size_t>(i)];
+            }
+            const double avgSec = sum / static_cast<double>(tapCount);
+            if (avgSec > 0.01) {
+                setManualBpm(static_cast<float>(60.0 / avgSec));
+            }
+        }
+    }
+    lastTapTimeSec = nowSec;
+}
+
 MidiActivitySnapshot PedalBoardAudioProcessor::getLastMidiActivity() const noexcept {
     MidiActivitySnapshot snap;
     snap.timestampMs = lastMidiTimestampMs.load(std::memory_order_acquire);
@@ -1242,6 +1308,10 @@ void PedalBoardAudioProcessor::resetStudioSettingsToDefaults() {
     signalChain.setNamLoudnessNormalization(true);
     signalChain.getTuner().setReferenceHz(440.0f);
     midiProgramChangeEnabled.store(true, std::memory_order_relaxed);
+    manualBpm.store(120.0f, std::memory_order_relaxed);
+    if (!hostTempoSynced.load(std::memory_order_relaxed)) {
+        effectiveBpm.store(120.0f, std::memory_order_relaxed);
+    }
     expressionPedalCc.store(11, std::memory_order_release);
     expressionLearnArmed.store(false, std::memory_order_release);
     saveStudioSettings();

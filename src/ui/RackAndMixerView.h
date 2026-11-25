@@ -76,6 +76,7 @@ public:
 
         for (auto& k : knobs) {
             k->slider.setValue(snap.params[static_cast<size_t>(k->paramIdx)], juce::dontSendNotification);
+            k->slider.updateText();
         }
         for (auto& t : toggles) {
             t->btn.setToggleState(snap.params[static_cast<size_t>(t->paramIdx)] > 0.5f, juce::dontSendNotification);
@@ -128,19 +129,27 @@ public:
 
         if (moduleId == ModuleId::StereoDelay && !lcdRect.isEmpty() && timeParamIdx >= 0) {
             const auto snap = processor.getRackSlot(rackIdx);
-            const int ms = static_cast<int>(std::lround(snap.params[static_cast<size_t>(timeParamIdx)]));
+            const float rawMs = snap.params[static_cast<size_t>(timeParamIdx)];
+            const bool synced = (timeSyncParamIdx >= 0 && snap.params[static_cast<size_t>(timeSyncParamIdx)] > 0.5f);
+            const juce::String mainReadout = synced
+                ? juce::String(tempo_sync::delayDivisionLabel(rawMs, timeMinMs, timeMaxMs))
+                : (juce::String(static_cast<int>(std::lround(rawMs))) + " ms");
+            const juce::String subReadout = synced
+                ? (juce::String(static_cast<int>(std::lround(tempo_sync::syncedDelayMs(rawMs, timeMinMs, timeMaxMs, processor.getEffectiveBpm())))) + " ms  SYNC")
+                : juce::String::fromUTF8(entry.name).toUpperCase();
+
             g.setColour(juce::Colour(0xff0b0f16));
             g.fillRoundedRectangle(lcdRect, 6.0f);
-            g.setColour(active ? accent.withAlpha(0.65f) : juce::Colour(0xff262c38));
+            g.setColour(active ? (synced ? juce::Colour(0xff38bdf8).withAlpha(0.75f) : accent.withAlpha(0.65f)) : juce::Colour(0xff262c38));
             g.drawRoundedRectangle(lcdRect, 6.0f, 1.0f);
 
             auto lcdInner = lcdRect.reduced(4.0f, 5.0f);
-            g.setColour(active ? juce::Colour(0xfffbbf24) : juce::Colour(0xff475569));
+            g.setColour(active ? (synced ? juce::Colour(0xff38bdf8) : juce::Colour(0xfffbbf24)) : juce::Colour(0xff475569));
             g.setFont(juce::Font(juce::FontOptions(lcdRect.getWidth() < 92.0f ? 14.5f : 16.8f, juce::Font::bold)));
-            g.drawText(juce::String(ms) + " ms", lcdInner.removeFromTop(lcdInner.getHeight() * 0.60f), juce::Justification::centred);
+            g.drawText(mainReadout, lcdInner.removeFromTop(lcdInner.getHeight() * 0.60f), juce::Justification::centred);
             g.setColour(active ? accent.brighter(0.15f) : juce::Colour(0xff475569));
             g.setFont(juce::Font(juce::FontOptions(8.0f, juce::Font::bold)));
-            g.drawText(juce::String::fromUTF8(entry.name).toUpperCase(), lcdInner, juce::Justification::centred, true);
+            g.drawText(subReadout, lcdInner, juce::Justification::centred, true);
         }
     }
 
@@ -291,6 +300,9 @@ private:
         toggles.clear();
         choices.clear();
         timeParamIdx = -1;
+        timeSyncParamIdx = -1;
+        timeMinMs = 30.0f;
+        timeMaxMs = 1500.0f;
 
         const auto specs = getSlotParamSpecs(moduleId, modelIdx);
         const auto& entry = gp200::getModelEntry(moduleId, modelIdx);
@@ -302,6 +314,10 @@ private:
 
             if (juce::String(sp.label).equalsIgnoreCase("TIME")) {
                 timeParamIdx = pIdx;
+                timeMinMs = sp.minVal;
+                timeMaxMs = sp.maxVal;
+                bool dummyIsDly = false;
+                timeSyncParamIdx = findSyncToggleIndexForParam(specs, pIdx, dummyIsDly);
             }
 
             if (sp.isToggle()) {
@@ -313,6 +329,8 @@ private:
                 t->btn.onClick = [this, pIdx, rawBtn] {
                     if (!ignoreCallbacks) {
                         processor.setRackSlotParam(rackIdx, pIdx, rawBtn->getToggleState() ? 1.0f : 0.0f);
+                        for (auto& k : knobs) k->slider.updateText();
+                        repaint();
                     }
                 };
                 addAndMakeVisible(t->btn);
@@ -369,6 +387,26 @@ private:
                 item->slider.getProperties().set("showTicks", true);
                 if (sp.suffix != nullptr && sp.suffix[0] != '\0') {
                     item->slider.setTextValueSuffix(juce::String(" ") + sp.suffix);
+                }
+                bool isDelaySync = false;
+                const int syncIdx = findSyncToggleIndexForParam(specs, pIdx, isDelaySync);
+                if (syncIdx >= 0) {
+                    const float minV = sp.minVal;
+                    const float maxV = sp.maxVal;
+                    const juce::String sfx = (sp.suffix != nullptr && sp.suffix[0] != '\0')
+                                                 ? (juce::String(" ") + sp.suffix)
+                                                 : juce::String();
+                    item->slider.textFromValueFunction = [this, syncIdx, isDelaySync, minV, maxV, sfx](double v) -> juce::String {
+                        const auto cur = processor.getRackSlot(rackIdx);
+                        if (cur.params[static_cast<size_t>(syncIdx)] > 0.5f) {
+                            return isDelaySync
+                                ? juce::String(tempo_sync::delayDivisionLabel(static_cast<float>(v), minV, maxV))
+                                : juce::String(tempo_sync::modDivisionLabel(static_cast<float>(v), minV, maxV));
+                        }
+                        const int dec = (maxV - minV) >= 40.0f ? 0 : ((maxV - minV) >= 10.0f ? 1 : 2);
+                        return juce::String(v, dec) + sfx;
+                    };
+                    item->slider.updateText();
                 }
                 auto* rawSl = &item->slider;
                 item->slider.onValueChange = [this, pIdx, rawSl] {
@@ -443,6 +481,9 @@ private:
     ModuleId moduleId;
     int currentModelIndex = -1;
     int timeParamIdx = -1;
+    int timeSyncParamIdx = -1;
+    float timeMinMs = 30.0f;
+    float timeMaxMs = 1500.0f;
     bool ignoreCallbacks = false;
     juce::Colour accent;
     juce::ComboBox modelBox;

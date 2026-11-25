@@ -41,6 +41,10 @@ public:
             case 13: return "Dual Independent Rigs (Pre/Post Chain A || Pre/Post Chain B)";
             case 20: return sidebarOpen ? "Hide Gear Library Sidebar (G)" : "Show Gear Library Sidebar (G)";
             case 21: return "TONE3000 Cloud Browser (T) — Search & load .nam Amps, Pedals & .wav IRs";
+            case 30: return processor.isUsingHostDawTempo()
+                                ? "Host DAW Tempo (active) — Used by all SYNC-enabled Delays, Mods & Filters"
+                                : "Master Tempo (BPM) — Drag up/down or scroll to adjust, double-click for 120 BPM";
+            case 31: return "Tap Tempo (B) — Click or press B repeatedly to set Master BPM";
             default: return {};
         }
     }
@@ -69,9 +73,20 @@ public:
     void refreshLiveState() {
         const int count = static_cast<int>(processor.getActivePedalSlotIds().size());
         const auto mode = processor.getRoutingMode();
-        if (count != lastPedalCount || mode != lastRoutingMode) {
+        const float bpm = processor.getEffectiveBpm();
+        const bool dawSync = processor.isUsingHostDawTempo();
+        const int64_t tapMs = processor.getLastTapTempoMs();
+        const bool tapLitNow = (tapMs > 0 && (static_cast<int64_t>(juce::Time::getMillisecondCounterHiRes()) - tapMs) < 170);
+
+        if (count != lastPedalCount || mode != lastRoutingMode
+            || std::abs(bpm - lastDisplayedBpm) > 0.05f
+            || dawSync != lastDawSync
+            || tapLitNow != lastTapLit) {
             lastPedalCount = count;
             lastRoutingMode = mode;
+            lastDisplayedBpm = bpm;
+            lastDawSync = dawSync;
+            lastTapLit = tapLitNow;
             repaint();
         }
     }
@@ -107,6 +122,50 @@ public:
             if (cloudCb) cloudCb();
             return;
         }
+        if (z == 30) {
+            draggingBpm = true;
+            dragStartY = e.y;
+            dragStartBpm = processor.getManualBpm();
+            return;
+        }
+        if (z == 31) {
+            processor.triggerTapTempo();
+            repaint();
+            return;
+        }
+    }
+
+    void mouseDrag(const juce::MouseEvent& e) override {
+        if (draggingBpm) {
+            const float deltaBpm = static_cast<float>(dragStartY - e.y) * 0.45f;
+            processor.setManualBpm(dragStartBpm + deltaBpm);
+            repaint();
+        }
+    }
+
+    void mouseUp(const juce::MouseEvent&) override {
+        draggingBpm = false;
+    }
+
+    void mouseDoubleClick(const juce::MouseEvent& e) override {
+        if (hitTestZone(e.getPosition()) == 30) {
+            processor.setManualBpm(120.0f);
+            repaint();
+        }
+    }
+
+    void mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override {
+        const int z = hitTestZone(e.getPosition());
+        if (z == 30 || z == 31) {
+            const float step = e.mods.isShiftDown() ? 5.0f : 1.0f;
+            const float delta = (wheel.deltaY > 0.0f ? step : (wheel.deltaY < 0.0f ? -step : 0.0f));
+            if (std::abs(delta) > 0.01f) {
+                processor.setManualBpm(processor.getManualBpm() + delta);
+                repaint();
+            }
+            return;
+        }
+        Component::mouseWheelMove(e, wheel);
     }
 
     void paint(juce::Graphics& g) override {
@@ -172,7 +231,60 @@ public:
             }
         }
 
-        // 2. Direct 1-Click 4-Topology Routing Switch (1x | A/B | 3x | A||B)
+        // 2a. Master Tempo BPM + TAP Capsule (Synced to DAW PlayHead in VST3, Tap/Drag/Scroll in Standalone!)
+        if (!tempoCapsuleRect.isEmpty()) {
+            auto tr = tempoCapsuleRect.toFloat();
+            const bool bpmHov = (hoveredZone == 30 || draggingBpm);
+            const bool tapHov = (hoveredZone == 31);
+            const float curBpm = processor.getEffectiveBpm();
+            const bool dawSync = processor.isUsingHostDawTempo();
+            const int64_t tapMs = processor.getLastTapTempoMs();
+            const bool tapFlash = (tapMs > 0 && (static_cast<int64_t>(juce::Time::getMillisecondCounterHiRes()) - tapMs) < 170);
+
+            g.setColour(juce::Colour(0xff090c12));
+            g.fillRoundedRectangle(tr, 5.0f);
+            g.setColour(tapFlash ? juce::Colour(0xfff59e0b).withAlpha(0.75f)
+                                 : (dawSync ? juce::Colour(0xff38bdf8).withAlpha(0.45f)
+                                            : juce::Colour((bpmHov || tapHov) ? 0xff3b465c : 0xff232b3a)));
+            g.drawRoundedRectangle(tr, 5.0f, 0.9f);
+
+            // BPM readout half
+            auto br = bpmDisplayRect.toFloat();
+            if (bpmHov) {
+                g.setColour(juce::Colours::white.withAlpha(0.045f));
+                g.fillRoundedRectangle(br.reduced(1.5f), 3.6f);
+            }
+            const float dotR = 2.3f;
+            const auto dotCol = tapFlash ? juce::Colour(0xfff59e0b)
+                                         : (dawSync ? juce::Colour(0xff38bdf8) : juce::Colour(0xff22c55e));
+            g.setColour(dotCol);
+            g.fillEllipse(br.getX() + 7.5f - dotR, br.getCentreY() - dotR, dotR * 2.0f, dotR * 2.0f);
+
+            const bool isWhole = std::abs(curBpm - std::round(curBpm)) < 0.05f;
+            const juce::String bpmStr = juce::String(curBpm, isWhole ? 0 : 1) + (dawSync ? " DAW" : " BPM");
+            g.setColour(bpmHov ? juce::Colours::white : juce::Colour(0xffe2e8f0));
+            g.setFont(juce::Font(juce::FontOptions(9.0f, juce::Font::bold)));
+            g.drawText(bpmStr, br.withTrimmedLeft(13.0f).withTrimmedRight(3.0f), juce::Justification::centred, true);
+
+            // Vertical hairline separator
+            g.setColour(juce::Colour(0xff1e2533));
+            g.drawVerticalLine(tapBtnRect.getX(), tr.getY() + 4.0f, tr.getBottom() - 4.0f);
+
+            // TAP button half
+            auto tapR = tapBtnRect.toFloat().reduced(1.5f);
+            if (tapFlash) {
+                g.setColour(juce::Colour(0xfff59e0b).withAlpha(0.28f));
+                g.fillRoundedRectangle(tapR, 3.6f);
+            } else if (tapHov) {
+                g.setColour(juce::Colours::white.withAlpha(0.06f));
+                g.fillRoundedRectangle(tapR, 3.6f);
+            }
+            g.setColour(tapFlash ? juce::Colour(0xfffbbf24) : (tapHov ? juce::Colours::white : juce::Colour(0xff94a3b8)));
+            g.setFont(juce::Font(juce::FontOptions(8.8f, juce::Font::bold)));
+            g.drawText("TAP", tapR, juce::Justification::centred, false);
+        }
+
+        // 2b. Direct 1-Click 4-Topology Routing Switch (1x | A/B | 3x | A||B)
         const int curModeIdx = static_cast<int>(processor.getRoutingMode());
         auto segTrack = routingTrackRect.toFloat();
         g.setColour(juce::Colour(0xff090c12));
@@ -290,6 +402,22 @@ public:
         for (int s = 0; s < 4; ++s) {
             routingSegRects[static_cast<size_t>(s)] = (s == 3) ? segCursor : segCursor.removeFromLeft(segW);
         }
+
+        // Tempo BPM + TAP Capsule cleanly positioned left of Routing switch (only if space fits cleanly!)
+        const int leftEdge = tabRects[3].getRight() + 10;
+        const int tempoW = compact ? 112 : 126;
+        rightArea.removeFromRight(8);
+        if (rightArea.getRight() - tempoW >= leftEdge) {
+            tempoCapsuleRect = rightArea.removeFromRight(tempoW);
+            auto tc = tempoCapsuleRect;
+            const int tapW = compact ? 34 : 38;
+            tapBtnRect = tc.removeFromRight(tapW);
+            bpmDisplayRect = tc;
+        } else {
+            tempoCapsuleRect = {};
+            bpmDisplayRect = {};
+            tapBtnRect = {};
+        }
     }
 
 private:
@@ -302,6 +430,8 @@ private:
         }
         if (gearToggleRect.contains(pt)) return 20;
         if (cloudBtnRect.contains(pt)) return 21;
+        if (bpmDisplayRect.contains(pt)) return 30;
+        if (tapBtnRect.contains(pt)) return 31;
         return -1;
     }
 
@@ -357,9 +487,18 @@ private:
     bool cloudConnected = false;
     int lastPedalCount = -1;
     RoutingMode lastRoutingMode = RoutingMode::Serial;
+    float lastDisplayedBpm = 120.0f;
+    bool lastDawSync = false;
+    bool lastTapLit = false;
+    bool draggingBpm = false;
+    int dragStartY = 0;
+    float dragStartBpm = 120.0f;
     int hoveredZone = -1;
 
     std::array<juce::Rectangle<int>, 4> tabRects {};
+    juce::Rectangle<int> tempoCapsuleRect;
+    juce::Rectangle<int> bpmDisplayRect;
+    juce::Rectangle<int> tapBtnRect;
     juce::Rectangle<int> routingTrackRect;
     std::array<juce::Rectangle<int>, 4> routingSegRects {};
     juce::Rectangle<int> cloudBtnRect;

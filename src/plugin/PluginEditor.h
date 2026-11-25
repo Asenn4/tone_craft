@@ -50,7 +50,7 @@ private:
     void timerCallback() override;
     void selectStageTab(StageViewTab tab, int rigIndex = -2);
     void togglePresetBrowser();
-    void openTone3000Browser(CloudLoadTargetKind kind, int rigOrSlotIndex = 0);
+    void openTone3000Browser(CloudLoadTargetKind kind, int rigOrSlotIndex = 0, const juce::String& searchQuery = {});
     void handleCloudCaptureLoaded(const CloudLoadRequest& req);
     void toggleGearSidebar();
     void handleSavePreset();

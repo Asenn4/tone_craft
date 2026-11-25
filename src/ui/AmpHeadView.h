@@ -2,6 +2,7 @@
 
 #include "../engine/Gp200Catalogue.h"
 #include "../engine/Gp200ParamSpecs.h"
+#include "../engine/ModelPackRegistry.h"
 #include "../plugin/Parameters.h"
 #include "../plugin/PluginProcessor.h"
 #include "HardwarePrimitives.h"
@@ -117,6 +118,19 @@ public:
         clearNamBtn.onClick = [this] { if (clearNamCb) clearNamCb(activeRig); };
         addAndMakeVisible(clearNamBtn);
 
+        findPackBtn.setButtonText("FIND .NAM");
+        findPackBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff0f766e));
+        findPackBtn.onClick = [this] {
+            const int m = getCurrentModelIndex();
+            const auto& e = gp200::getModelEntry(ModuleId::AmpHead, m);
+            const auto info = ModelPackRegistry::getExcelPackInfo(e.excelNo);
+            const juce::String q = (info.searchQuery != nullptr && info.searchQuery[0] != '\0')
+                ? juce::String::fromUTF8(info.searchQuery)
+                : juce::String::fromUTF8(e.description);
+            if (findPackCloudCb) findPackCloudCb(activeRig, q);
+        };
+        addAndMakeVisible(findPackBtn);
+
         for (int i = 0; i < 7; ++i) {
             knobs[static_cast<size_t>(i)].setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
             knobs[static_cast<size_t>(i)].setTextBoxStyle(juce::Slider::TextBoxBelow, false, 60, 14);
@@ -164,6 +178,10 @@ public:
 
     void setBrowseCloudNamCallback(std::function<void(int)> cb) {
         browseCloudNamCb = std::move(cb);
+    }
+
+    void setFindPackOnCloudCallback(std::function<void(int, const juce::String&)> cb) {
+        findPackCloudCb = std::move(cb);
     }
 
     void updateLive() {
@@ -256,14 +274,28 @@ public:
 
             const auto infoBox = lay.ampInfoFull;
             if (infoBox.getWidth() >= 80.0f) {
+                const auto& ampRef = processor.getSignalChain().getAmpHead(activeRig);
+                const bool hasPackNam = ampRef.isUsingPackNam();
                 const float titleH = std::min(26.0f, infoBox.getHeight() * 0.44f);
                 const float descH  = std::min(16.0f, infoBox.getHeight() * 0.28f);
                 const float typeH  = std::max(12.0f, infoBox.getHeight() - titleH - descH);
 
+                auto titleRow = infoBox.withHeight(titleH);
+                if (hasPackNam && infoBox.getWidth() >= 190.0f) {
+                    auto badge = titleRow.removeFromRight(76.0f).reduced(0.0f, 3.0f);
+                    g.setColour(active ? juce::Colour(0xff0891b2).withAlpha(0.24f) : juce::Colour(0xff232834));
+                    g.fillRoundedRectangle(badge, 4.0f);
+                    g.setColour(active ? juce::Colour(0xff22d3ee) : juce::Colour(0xff64748b));
+                    g.drawRoundedRectangle(badge, 4.0f, 1.0f);
+                    g.setFont(juce::Font(juce::FontOptions(8.4f, juce::Font::bold)));
+                    g.drawText("NAM PACK", badge, juce::Justification::centred);
+                    titleRow.removeFromRight(6.0f);
+                }
+
                 g.setColour(active ? accent : juce::Colour(0xff64748b));
                 g.setFont(juce::Font(juce::FontOptions(infoBox.getWidth() < 260.0f ? 16.0f : 20.5f,
                                                        juce::Font::bold | juce::Font::italic)));
-                g.drawText(juce::String::fromUTF8(entry.name), infoBox.withHeight(titleH),
+                g.drawText(juce::String::fromUTF8(entry.name), titleRow,
                            juce::Justification::centredLeft, true);
 
                 g.setColour(active ? juce::Colour(0xffcbd5e1) : juce::Colour(0xff5a6373));
@@ -272,9 +304,12 @@ public:
                            infoBox.withTop(infoBox.getY() + titleH).withHeight(descH),
                            juce::Justification::centredLeft, true);
 
-                g.setColour(juce::Colour(0xff64748b));
-                g.setFont(juce::Font(juce::FontOptions(8.8f, juce::Font::plain)));
-                g.drawText(juce::String("Type: ") + juce::String::fromUTF8(entry.subType) + "   |   " + juce::String::fromUTF8(entry.paramsHint),
+                g.setColour(hasPackNam && active ? juce::Colour(0xff67e8f9) : juce::Colour(0xff64748b));
+                g.setFont(juce::Font(juce::FontOptions(8.8f, hasPackNam ? juce::Font::bold : juce::Font::plain)));
+                const juce::String subLine = hasPackNam
+                    ? (juce::String("Neural Capture Active: ") + ampRef.getPackNamDisplayName())
+                    : (juce::String("Type: ") + juce::String::fromUTF8(entry.subType) + "   |   " + juce::String::fromUTF8(entry.paramsHint));
+                g.drawText(subLine,
                            infoBox.withTop(infoBox.getY() + titleH + descH).withHeight(typeH),
                            juce::Justification::centredLeft, true);
             }
@@ -390,8 +425,9 @@ public:
         modeNamBtn.setBounds(topSwitchRow.removeFromLeft(modeW));
         topSwitchRow.removeFromLeft(8);
 
-        // Mode-specific controls: DSP dropdown + Clean/Drive/Hi-Gain ONLY in AMP MODELS mode; Load/Clear NAM ONLY in NAM mode!
+        // Mode-specific controls: DSP dropdown + Find .NAM + Clean/Drive/Hi-Gain ONLY in AMP MODELS mode; Load/Clear NAM ONLY in NAM mode!
         ampModelBox.setVisible(!isNam);
+        findPackBtn.setVisible(!isNam);
         for (int i = 0; i < 3; ++i) {
             channelBtns[static_cast<size_t>(i)].setVisible(!isNam);
         }
@@ -400,13 +436,17 @@ public:
         clearNamBtn.setVisible(isNam);
 
         if (!isNam) {
-            const int chGroupW = narrowTop ? 168 : 204;
+            const int chGroupW = narrowTop ? 154 : 192;
             auto chGroup = topSwitchRow.removeFromRight(chGroupW);
             const int chW = chGroup.getWidth() / 3;
             for (int i = 0; i < 3; ++i) {
                 channelBtns[static_cast<size_t>(i)].setBounds(chGroup.removeFromLeft(chW).reduced(2, 0));
             }
-            topSwitchRow.removeFromRight(6);
+            topSwitchRow.removeFromRight(5);
+            const int findW = narrowTop ? 58 : 74;
+            findPackBtn.setButtonText(narrowTop ? "T3K" : "FIND .NAM");
+            findPackBtn.setBounds(topSwitchRow.removeFromRight(findW));
+            topSwitchRow.removeFromRight(5);
             ampModelBox.setBounds(topSwitchRow);
         } else {
             auto namBtns = lay.namDeckRect.toNearestInt().reduced(10, 8).removeFromRight(static_cast<int>(lay.namBtnColW));
@@ -800,6 +840,20 @@ private:
                               active ? juce::Colour(0xffe2e8f0) : juce::Colour(0xff64748b));
         cloudNamBtn.repaint();
 
+        const auto& curEntry = gp200::getModelEntry(ModuleId::AmpHead, m);
+        const auto packHint = ModelPackRegistry::getExpectedFilenameHint(ModuleId::AmpHead, m);
+        const auto packInfo = ModelPackRegistry::getExcelPackInfo(curEntry.excelNo);
+        findPackBtn.setTooltip(
+            "Find real .nam capture on TONE3000 (\"" + juce::String::fromUTF8(packInfo.searchQuery)
+            + "\"). Save as " + packHint + " in ModelPacks to auto-bind!"
+        );
+        findPackBtn.getProperties().set("bypassed", !active);
+        findPackBtn.setColour(juce::TextButton::buttonColourId,
+                              active ? juce::Colour(0xff0f766e) : juce::Colour(0xff232934));
+        findPackBtn.setColour(juce::TextButton::textColourOffId,
+                              active ? juce::Colour(0xffe2e8f0) : juce::Colour(0xff64748b));
+        findPackBtn.repaint();
+
         const bool hasNamFile = processor.getSignalChain().getAmpHead(activeRig).getNamRunner().hasLoadedModel();
         clearNamBtn.setEnabled(hasNamFile);
         clearNamBtn.setAlpha(hasNamFile ? 1.0f : 0.45f);
@@ -833,6 +887,7 @@ private:
     std::function<void(int)> loadNamCb;
     std::function<void(int)> clearNamCb;
     std::function<void(int)> browseCloudNamCb;
+    std::function<void(int, const juce::String&)> findPackCloudCb;
 
     int activeRig = 0;
     RoutingMode lastRoutingMode = RoutingMode::Serial;
@@ -852,7 +907,7 @@ private:
     ChromePowerToggle powerSwitch;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> powerAtt;
 
-    juce::TextButton loadNamBtn, cloudNamBtn, clearNamBtn;
+    juce::TextButton loadNamBtn, cloudNamBtn, clearNamBtn, findPackBtn;
 
     std::array<MidiBindableSlider, 7> knobs;
     std::array<juce::Label, 7> knobLabels;

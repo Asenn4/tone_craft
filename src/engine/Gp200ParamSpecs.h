@@ -3,6 +3,7 @@
 // Authentic Per-Model Parameter Specifications matching Daftar_Effect_GP-200.xlsx
 // Covers ALL 265 Valeton GP-200 models across NR, PRE, WAH, DST, AMP (+ Neural NAM), CAB, EQ, MOD, DLY, RVB.
 
+#include "../dsp/TempoSync.h"
 #include "Gp200Catalogue.h"
 #include "ModuleId.h"
 
@@ -814,6 +815,47 @@ inline std::array<float, kMaxSlotParams> defaultParamsForCategory(ModuleId categ
         out[i] = specs[i].defaultVal;
     }
     return out;
+}
+
+// Finds the matching SYNC toggle index for a TIME or RATE parameter in a GP-200 spec list.
+// Returns -1 if this parameter has no tempo sync toggle.
+inline int findSyncToggleIndexForParam(const std::vector<PedalSlotParamSpec>& specs,
+                                       int paramIdx,
+                                       bool& outIsDelayTime) noexcept {
+    outIsDelayTime = false;
+    if (paramIdx < 0 || paramIdx >= static_cast<int>(specs.size())) return -1;
+    const juce::String lbl(specs[static_cast<size_t>(paramIdx)].label);
+
+    juce::String targetToggle;
+    juce::String fallbackToggle;
+    if (lbl.equalsIgnoreCase("TIME")) {
+        outIsDelayTime = true;
+        targetToggle   = "TIME SYNC";
+        fallbackToggle = "SYNC";
+    } else if (lbl.equalsIgnoreCase("FLG RATE")) {
+        targetToggle = "FLG SYNC";
+    } else if (lbl.equalsIgnoreCase("TRM RATE")) {
+        targetToggle = "TRM SYNC";
+    } else if (lbl.equalsIgnoreCase("PHS RATE")) {
+        targetToggle = "PHS SYNC";
+    } else if (lbl.equalsIgnoreCase("PAN RATE")) {
+        targetToggle = "PAN SYNC";
+    } else if (lbl.equalsIgnoreCase("SWP RATE")) {
+        targetToggle = "SWP SYNC";
+    } else if (lbl.equalsIgnoreCase("RATE")) {
+        targetToggle = "SYNC";
+    } else {
+        return -1;
+    }
+
+    int fallbackIdx = -1;
+    for (size_t i = 0; i < specs.size(); ++i) {
+        if (!specs[i].isToggle()) continue;
+        const juce::String tLbl(specs[i].label);
+        if (tLbl.equalsIgnoreCase(targetToggle)) return static_cast<int>(i);
+        if (fallbackToggle.isNotEmpty() && tLbl.equalsIgnoreCase(fallbackToggle)) fallbackIdx = static_cast<int>(i);
+    }
+    return fallbackIdx;
 }
 
 // ==============================================================================

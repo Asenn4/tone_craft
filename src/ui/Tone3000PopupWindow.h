@@ -153,8 +153,9 @@ public:
         pickedModelList.setModel(nullptr);
     }
 
-    void prepareForTarget(CloudLoadTargetKind kind, int rigOrSlotIndex) {
+    void prepareForTarget(CloudLoadTargetKind kind, int rigOrSlotIndex, const juce::String& initialQuery = {}) {
         activeTargetKind = kind;
+        pendingSearchQuery = initialQuery.trim();
         if (kind == CloudLoadTargetKind::NamPedal) {
             activeTargetSlotId = rigOrSlotIndex;
         } else if (kind == CloudLoadTargetKind::AmpRig || kind == CloudLoadTargetKind::CabRig) {
@@ -165,13 +166,16 @@ public:
         apiKeyEditor.setText(client.getPublishableKey(), false);
         showKeyBar = !client.hasPublishableKey();
         if (nativeLibrary != nullptr) {
-            nativeLibrary->openForTarget(kind, rigOrSlotIndex);
+            nativeLibrary->openForTarget(kind, rigOrSlotIndex, pendingSearchQuery);
         }
 
         updateHeaderStyles();
         if (webViewReady) {
             setMode(Mode::WebCatalog);
-            if (client.hasPublishableKey()) {
+            if (pendingSearchQuery.isNotEmpty()) {
+                openUrlInEmbeddedWeb(publicBrowseUrlForCurrentTarget());
+                setStatus("Searching TONE3000 for \"" + pendingSearchQuery + "\" — download .nam/.wav or click SELECT TONE for 1-click Auto-Load.");
+            } else if (client.hasPublishableKey()) {
                 launchEmbeddedCatalogOrConnect(true);
             } else {
                 openUrlInEmbeddedWeb(publicBrowseUrlForCurrentTarget());
@@ -538,10 +542,20 @@ private:
     }
 
     juce::String publicBrowseUrlForCurrentTarget() const {
-        if (activeTargetKind == CloudLoadTargetKind::NamPedal) return "https://www.tone3000.com/search?gears=pedal&format=nam";
-        if (activeTargetKind == CloudLoadTargetKind::AmpRig)   return "https://www.tone3000.com/search?gears=amp_amp-cab&format=nam";
-        if (activeTargetKind == CloudLoadTargetKind::CabRig)   return "https://www.tone3000.com/search?gears=cab&format=ir";
-        return "https://www.tone3000.com/tones";
+        juce::URL url("https://www.tone3000.com/search");
+        if (pendingSearchQuery.isNotEmpty()) {
+            url = url.withParameter("q", pendingSearchQuery);
+        }
+        if (activeTargetKind == CloudLoadTargetKind::NamPedal) {
+            return url.withParameter("gears", "pedal").toString(true);
+        }
+        if (activeTargetKind == CloudLoadTargetKind::AmpRig) {
+            return url.withParameter("gears", "amp").toString(true);
+        }
+        if (activeTargetKind == CloudLoadTargetKind::CabRig) {
+            return url.withParameter("format", "ir").toString(true);
+        }
+        return pendingSearchQuery.isNotEmpty() ? url.toString(true) : juce::String("https://www.tone3000.com/search");
     }
 
     void launchEmbeddedCatalogOrConnect(bool selectTonePrompt, bool updateStatusMsg = true) {
@@ -796,6 +810,7 @@ private:
     CloudLoadTargetKind activeTargetKind = CloudLoadTargetKind::Auto;
     int activeTargetRigIndex = 0;
     int activeTargetSlotId = -1;
+    juce::String pendingSearchQuery;
 
     t3k::ToneItem pickedTone;
     std::vector<t3k::ModelItem> pickedModels;
@@ -861,7 +876,10 @@ public:
         setLookAndFeel(nullptr);
     }
 
-    void showForTarget(juce::Component* anchor, CloudLoadTargetKind kind, int rigOrSlotIndex) {
+    void showForTarget(juce::Component* anchor,
+                       CloudLoadTargetKind kind,
+                       int rigOrSlotIndex,
+                       const juce::String& initialQuery = {}) {
         if (!positionedOnce) {
             positionedOnce = true;
             int w = 1080;
@@ -880,7 +898,7 @@ public:
             }
         }
         if (content != nullptr) {
-            content->prepareForTarget(kind, rigOrSlotIndex);
+            content->prepareForTarget(kind, rigOrSlotIndex, initialQuery);
         }
         setVisible(true);
         toFront(true);

@@ -480,6 +480,76 @@ public:
 
     void mouseDown(const juce::MouseEvent& e) override {
         dragArmed = false;
+        const bool packStomp  = isPackCapableStompModel(currentCategory, currentModelIndex);
+        const bool packReverb = isPackCapableReverbModel(currentCategory, currentModelIndex);
+        const bool hybridPre  = isHybridPreampColorModel(currentCategory, currentModelIndex);
+        if (e.mods.isRightButtonDown() && (packStomp || packReverb || hybridPre)) {
+            const auto& entry = gp200::getModelEntry(currentCategory, currentModelIndex);
+            const auto info = ModelPackRegistry::getExcelPackInfo(entry.excelNo);
+            const auto hint = ModelPackRegistry::getExpectedFilenameHint(currentCategory, currentModelIndex);
+            const bool loaded = processor.getSignalChain().isSlotUsingPackCapture(slotId);
+            const bool preOn  = hybridPre && processor.getSignalChain().isSlotPreampColorEnabled(slotId);
+
+            juce::PopupMenu menu;
+            menu.addSectionHeader(juce::String::fromUTF8(entry.name)
+                                  + (hybridPre ? " — Hybrid Preamp + White-Box DSP"
+                                               : (" — ModelPack (#" + juce::String(entry.excelNo) + ")")));
+
+            if (hybridPre) {
+                menu.addItem(4, "Hybrid Preamp .NAM Color (Warm Analog Input)", true, preOn);
+                if (preOn && loaded) {
+                    menu.addItem(99, "Active Preamp: " + processor.getSignalChain().getSlotPackCaptureName(slotId), false, true);
+                } else {
+                    menu.addItem(99, "White-Box Analog C++ Circuit Active", false, false);
+                }
+                menu.addSeparator();
+                menu.addItem(2, "Open Local ModelPacks Folder...");
+                menu.addItem(3, "Rescan ModelPacks Now");
+            } else {
+                if (loaded) {
+                    menu.addItem(99, "Active: " + processor.getSignalChain().getSlotPackCaptureName(slotId), false, true);
+                } else {
+                    menu.addItem(99, "Expected file: " + hint + " (using DSP fallback)", false, false);
+                }
+                menu.addSeparator();
+                const juce::String q = (info.searchQuery != nullptr && info.searchQuery[0] != '\0')
+                    ? juce::String::fromUTF8(info.searchQuery)
+                    : juce::String::fromUTF8(entry.description);
+                const bool hasExt = (info.externalFreeUrl != nullptr && info.externalFreeUrl[0] != '\0');
+                menu.addItem(1, hasExt ? ("Open Free IR Source (" + juce::String::fromUTF8(info.externalFreeUrl) + ")")
+                                       : ("Find \"" + q + "\" on TONE3000..."));
+                menu.addItem(2, "Open Local ModelPacks Folder...");
+                menu.addItem(3, "Rescan ModelPacks Now");
+            }
+
+            const juce::String qStr = (info.searchQuery != nullptr && info.searchQuery[0] != '\0')
+                ? juce::String::fromUTF8(info.searchQuery)
+                : juce::String::fromUTF8(entry.description);
+            const bool hasExt = (info.externalFreeUrl != nullptr && info.externalFreeUrl[0] != '\0');
+            menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(localAreaToGlobal(getLocalBounds())),
+                               [this, qStr, hasExt, packReverb, preOn,
+                                extUrl = hasExt ? juce::String::fromUTF8(info.externalFreeUrl) : juce::String()](int res) {
+                                   if (res == 1) {
+                                       if (hasExt) {
+                                           juce::URL(extUrl).launchInDefaultBrowser();
+                                       } else {
+                                           auto url = juce::URL("https://www.tone3000.com/search").withParameter("q", qStr);
+                                           if (packReverb) url = url.withParameter("format", "ir");
+                                           else            url = url.withParameter("gears", "pedal");
+                                           url.launchInDefaultBrowser();
+                                       }
+                                   } else if (res == 2) {
+                                       ModelPackRegistry::getUserOverrideDirectory().revealToUser();
+                                   } else if (res == 3) {
+                                       processor.getSignalChain().refreshAllModelPacks();
+                                       repaint();
+                                   } else if (res == 4) {
+                                       processor.getSignalChain().setSlotPreampColorEnabled(slotId, !preOn);
+                                       repaint();
+                                   }
+                               });
+            return;
+        }
         if (e.mods.isLeftButtonDown() && getParentComponent() != nullptr) {
             dragArmed = true;
             if (boardDownCb) {
@@ -520,12 +590,26 @@ public:
 
         // Category code badge + Hardware model subtitle at top of dark bay
         const bool isNamPedal = isNamPedalSlotModel(currentCategory, currentModelIndex);
+        const bool hasPackCap = !isNamPedal && processor.getSignalChain().isSlotUsingPackCapture(slotId);
         const juce::String catCode = isNamPedal ? juce::String("NAM") : juce::String(valeton::gpCodeFor(currentCategory));
-        auto descRect = juce::Rectangle<float>(bounds.getX() + 12.0f, bayTop + 6.0f, bounds.getWidth() - 34.0f, 14.0f);
+        auto descRect = juce::Rectangle<float>(bounds.getX() + 12.0f, bayTop + 6.0f,
+                                               bounds.getWidth() - (hasPackCap ? 66.0f : 34.0f), 14.0f);
         g.setColour(juce::Colour(0xff94a3b8));
         g.setFont(juce::Font(juce::FontOptions(8.4f, juce::Font::italic)));
         g.drawText(juce::String("[") + catCode + "] " + activeModelDesc,
                    descRect, juce::Justification::centredLeft, true);
+
+        if (hasPackCap) {
+            const bool isIrPack = (currentCategory == ModuleId::Compressor && currentModelIndex == 10)
+                               || isPackCapableReverbModel(currentCategory, currentModelIndex);
+            auto badge = juce::Rectangle<float>(bounds.getRight() - 56.0f, bayTop + 6.5f, 30.0f, 13.0f);
+            g.setColour(active ? juce::Colour(0xff0891b2).withAlpha(0.24f) : juce::Colour(0xff232834));
+            g.fillRoundedRectangle(badge, 3.0f);
+            g.setColour(active ? juce::Colour(0xff22d3ee) : juce::Colour(0xff64748b));
+            g.drawRoundedRectangle(badge, 3.0f, 0.9f);
+            g.setFont(juce::Font(juce::FontOptions(7.6f, juce::Font::bold)));
+            g.drawText(isIrPack ? "IR" : "NAM", badge, juce::Justification::centred);
+        }
 
         // Neural NAM Pedal Capture OLED strip (zero color highlight when bypassed!)
         if (isNamPedal && !namOledRect.isEmpty()) {
@@ -861,6 +945,8 @@ private:
                 t->btn.onClick = [this, pIdx, rawBtn] {
                     if (!ignoreCallbacks) {
                         processor.setPedalSlotParam(slotId, pIdx, rawBtn->getToggleState() ? 1.0f : 0.0f);
+                        for (auto& c : controls) c->slider.updateText();
+                        repaint();
                     }
                 };
                 addAndMakeVisible(t->btn);
@@ -932,6 +1018,26 @@ private:
                 item->slider.getProperties().set("showTicks", true);
                 if (d.suffix != nullptr && d.suffix[0] != '\0') {
                     item->slider.setTextValueSuffix(juce::String(" ") + d.suffix);
+                }
+                bool isDelaySync = false;
+                const int syncIdx = findSyncToggleIndexForParam(specs, pIdx, isDelaySync);
+                if (syncIdx >= 0) {
+                    const float minV = d.minVal;
+                    const float maxV = d.maxVal;
+                    const juce::String sfx = (d.suffix != nullptr && d.suffix[0] != '\0')
+                                                 ? (juce::String(" ") + d.suffix)
+                                                 : juce::String();
+                    item->slider.textFromValueFunction = [this, syncIdx, isDelaySync, minV, maxV, sfx](double v) -> juce::String {
+                        const auto cur = processor.getPedalSlot(slotId);
+                        if (cur.params[static_cast<size_t>(syncIdx)] > 0.5f) {
+                            return isDelaySync
+                                ? juce::String(tempo_sync::delayDivisionLabel(static_cast<float>(v), minV, maxV))
+                                : juce::String(tempo_sync::modDivisionLabel(static_cast<float>(v), minV, maxV));
+                        }
+                        const int dec = (maxV - minV) >= 40.0f ? 0 : ((maxV - minV) >= 10.0f ? 1 : 2);
+                        return juce::String(v, dec) + sfx;
+                    };
+                    item->slider.updateText();
                 }
             }
 

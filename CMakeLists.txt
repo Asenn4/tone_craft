@@ -205,4 +205,50 @@ target_link_libraries(PedalBoard
 
 if(WIN32)
     target_link_libraries(PedalBoard PRIVATE crypt32)
+
+    # --------------------------------------------------------------------------
+    # Lazy-Loaded Embedded ModelPacks Bundle (PB_MODELPACKS RCDATA -> ModelPacks.zip)
+    # Packs any .nam / .wav captures placed in assets/modelpacks/ directly inside
+    # BOTH PedalBoard.exe & PedalBoard.vst3 with zero MSVC array bloat!
+    # --------------------------------------------------------------------------
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    set(PB_MODELPACKS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/assets/modelpacks")
+    set(PB_MODELPACKS_ZIP "${CMAKE_BINARY_DIR}/ModelPacks.zip")
+    set(PB_MODELPACKS_RC  "${CMAKE_BINARY_DIR}/ModelPacks.rc")
+
+    if(Python3_Interpreter_FOUND)
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/pack_modelpacks.py"
+                    "${PB_MODELPACKS_SRC}" "${PB_MODELPACKS_ZIP}"
+            RESULT_VARIABLE _pack_res
+        )
+        add_custom_target(PackModelPacks ALL
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/pack_modelpacks.py"
+                    "${PB_MODELPACKS_SRC}" "${PB_MODELPACKS_ZIP}"
+            COMMENT "Packing assets/modelpacks/ into compressed ModelPacks.zip resource..."
+        )
+    else()
+        if(NOT EXISTS "${PB_MODELPACKS_ZIP}")
+            file(WRITE "${PB_MODELPACKS_ZIP}" "")
+        endif()
+    endif()
+
+    file(TO_CMAKE_PATH "${PB_MODELPACKS_ZIP}" _pb_zip_rc_path)
+    file(WRITE "${PB_MODELPACKS_RC}" "PB_MODELPACKS RCDATA \"${_pb_zip_rc_path}\"\n")
+    set_source_files_properties("${PB_MODELPACKS_RC}" PROPERTIES
+        OBJECT_DEPENDS "${PB_MODELPACKS_ZIP}"
+    )
+
+    if(TARGET PedalBoard_Standalone)
+        target_sources(PedalBoard_Standalone PRIVATE "${PB_MODELPACKS_RC}")
+        if(TARGET PackModelPacks)
+            add_dependencies(PedalBoard_Standalone PackModelPacks)
+        endif()
+    endif()
+    if(TARGET PedalBoard_VST3)
+        target_sources(PedalBoard_VST3 PRIVATE "${PB_MODELPACKS_RC}")
+        if(TARGET PackModelPacks)
+            add_dependencies(PedalBoard_VST3 PackModelPacks)
+        endif()
+    endif()
 endif()

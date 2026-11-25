@@ -242,7 +242,7 @@ public:
     }
 
     // Open overlay pre-configured for a specific destination (Amp A/B/C, Cab A/B/C, NAM Pedal Slot, or Auto)
-    void openForTarget(CloudLoadTargetKind kind, int rigOrSlotIndex = 0) {
+    void openForTarget(CloudLoadTargetKind kind, int rigOrSlotIndex = 0, const juce::String& initialQuery = {}) {
         activeTargetKind = kind;
         if (kind == CloudLoadTargetKind::NamPedal) {
             activeTargetSlotId = rigOrSlotIndex;
@@ -257,6 +257,11 @@ public:
             activeGearFilter = 0; // ALL
         }
 
+        if (initialQuery.trim().isNotEmpty()) {
+            searchBox.setText(initialQuery.trim(), false);
+            currentPage = 1;
+        }
+
         rebuildTargetCombo();
         apiKeyEditor.setText(client.getPublishableKey(), false);
         showSetupBar = !client.isConnected();
@@ -267,7 +272,10 @@ public:
             if (client.getCachedUser().username.isEmpty()) {
                 fetchUserProfile();
             }
-            if (activeFeed == FeedTab::LocalCache) {
+            if (initialQuery.trim().isNotEmpty()) {
+                activeFeed = FeedTab::Search;
+                updateToolbarStyles();
+            } else if (activeFeed == FeedTab::LocalCache) {
                 activeFeed = FeedTab::Trending;
                 updateToolbarStyles();
             }

@@ -138,6 +138,14 @@ public:
     void setMidiProgramChangeEnabled(bool enabled);
     bool isMidiProgramChangeEnabled() const noexcept { return midiProgramChangeEnabled.load(std::memory_order_relaxed); }
 
+    // Master Tempo / Host DAW Sync & Tap Tempo (40..240 BPM)
+    void setManualBpm(float bpm);
+    float getManualBpm() const noexcept { return manualBpm.load(std::memory_order_relaxed); }
+    float getEffectiveBpm() const noexcept { return effectiveBpm.load(std::memory_order_relaxed); }
+    bool isUsingHostDawTempo() const noexcept { return hostTempoSynced.load(std::memory_order_relaxed); }
+    void triggerTapTempo();
+    int64_t getLastTapTempoMs() const noexcept { return lastTapTempoMs.load(std::memory_order_relaxed); }
+
     MidiActivitySnapshot getLastMidiActivity() const noexcept;
     float getDspCpuLoadPercent() const noexcept { return dspCpuLoadPercent.load(std::memory_order_relaxed); }
     int getCurrentAudioBlockSize() const noexcept { return currentBlockSize.load(std::memory_order_relaxed); }
@@ -189,6 +197,13 @@ private:
     std::atomic<bool> outputSafetyLimiter { true };
     std::atomic<bool> namLoudnessNorm { true };
     std::atomic<bool> midiProgramChangeEnabled { true };
+    std::atomic<float> manualBpm { 120.0f };
+    std::atomic<float> effectiveBpm { 120.0f };
+    std::atomic<bool> hostTempoSynced { false };
+    std::atomic<int64_t> lastTapTempoMs { 0 };
+    std::array<double, 4> tapIntervalsSec {};
+    int tapCount = 0;
+    double lastTapTimeSec = 0.0;
     std::atomic<int> currentBlockSize { 512 };
     std::atomic<float> dspCpuLoadPercent { 0.0f };
 

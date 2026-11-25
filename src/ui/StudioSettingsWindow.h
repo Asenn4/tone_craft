@@ -1356,6 +1356,20 @@ private:
             btn440.onClick = [this] { tunerRefSlider.setValue(440.0, juce::sendNotificationSync); };
             btn442.onClick = [this] { tunerRefSlider.setValue(442.0, juce::sendNotificationSync); };
 
+            setupLinear(tempoBpmSlider, " BPM");
+            tempoBpmSlider.setRange(40.0, 240.0, 0.5);
+            tempoBpmSlider.setDoubleClickReturnValue(true, 120.0);
+            tempoBpmSlider.onValueChange = [this] {
+                owner.processor.setManualBpm(static_cast<float>(tempoBpmSlider.getValue()));
+            };
+
+            tapTempoBtn.setButtonText("TAP TEMPO");
+            tapTempoBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff0f4c5c));
+            tapTempoBtn.onClick = [this] {
+                owner.processor.triggerTapTempo();
+                tempoBpmSlider.setValue(static_cast<double>(owner.processor.getManualBpm()), juce::dontSendNotification);
+            };
+
             resetDspBtn.setButtonText("RESET DSP SETTINGS TO DEFAULTS");
             resetDspBtn.onClick = [this] {
                 owner.processor.resetStudioSettingsToDefaults();
@@ -1366,12 +1380,13 @@ private:
                      &inputModePills, &hpfPills, &phaseSwitch,
                      &inTrimSlider, &outTrimSlider, &inMeter, &outMeter,
                      &tunerRefSlider, &btn432, &btn440, &btn442,
+                     &tempoBpmSlider, &tapTempoBtn,
                      &namNormSwitch, &safetyLimiterSwitch, &resetDspBtn }) {
                 addAndMakeVisible(*c);
             }
         }
 
-        int computePreferredHeight() const { return 634; }
+        int computePreferredHeight() const { return 674; }
 
         void syncFromProcessor() {
             inputModePills.setSelectedIndex(static_cast<int>(owner.processor.getInputChannelMode()), false);
@@ -1386,6 +1401,7 @@ private:
             namNormSwitch.setState(owner.processor.isNamLoudnessNormalization(), false);
             safetyLimiterSwitch.setState(owner.processor.isOutputSafetyLimiter(), false);
             tunerRefSlider.setValue(static_cast<double>(owner.processor.getTunerReferenceHz()), juce::dontSendNotification);
+            tempoBpmSlider.setValue(static_cast<double>(owner.processor.getEffectiveBpm()), juce::dontSendNotification);
             repaint();
         }
 
@@ -1417,9 +1433,10 @@ private:
             drawLabel(lblInTrimRect, "Input Trim Gain");
             drawLabel(lblOutTrimRect, "Master Output Trim");
 
-            drawCardFrame(g, tunerCardRect, "CHROMATIC TUNER CALIBRATION",
-                          "Global A4 reference pitch applied to the top rack chromatic tuner (saved automatically).");
+            drawCardFrame(g, tunerCardRect, "CHROMATIC TUNER & MASTER TEMPO (BPM SYNC)",
+                          "Global A4 calibration & Master BPM used by all SYNC-enabled Delays, Mods & Filters (follows DAW BPM in VST3).");
             drawLabel(lblTunerRect, "A4 Reference Pitch");
+            drawLabel(lblTempoRect, owner.processor.isUsingHostDawTempo() ? "Master Tempo (DAW)" : "Master Tempo (BPM)");
 
             drawCardFrame(g, engineCardRect, "NEURAL NAM ENGINE & MASTER PROTECTION",
                           "Control neural capture loudness normalization and output peak limiting.");
@@ -1468,7 +1485,7 @@ private:
             }
 
             area.removeFromTop(14);
-            tunerCardRect = area.removeFromTop(108);
+            tunerCardRect = area.removeFromTop(146);
             {
                 auto in = tunerCardRect.reduced(14, 12);
                 in.removeFromTop(38);
@@ -1481,6 +1498,13 @@ private:
                 btn432.setBounds(row.removeFromRight(62));
                 row.removeFromRight(10);
                 tunerRefSlider.setBounds(row);
+
+                in.removeFromTop(10);
+                auto row2 = in.removeFromTop(30);
+                lblTempoRect = row2.removeFromLeft(130);
+                tapTempoBtn.setBounds(row2.removeFromRight(106));
+                row2.removeFromRight(10);
+                tempoBpmSlider.setBounds(row2);
             }
 
             area.removeFromTop(14);
@@ -1507,14 +1531,14 @@ private:
         StudioSettingsContent& owner;
         juce::Rectangle<int> inputCardRect, tunerCardRect, engineCardRect;
         juce::Rectangle<int> lblModeRect, lblHpfRect, lblPhaseRect, lblInTrimRect, lblOutTrimRect;
-        juce::Rectangle<int> lblTunerRect, lblNamNormRect, lblLimitRect;
+        juce::Rectangle<int> lblTunerRect, lblTempoRect, lblNamNormRect, lblLimitRect;
 
         settings_ui::SegmentedPillGroup inputModePills, hpfPills;
         settings_ui::StudioSwitchPill phaseSwitch, namNormSwitch, safetyLimiterSwitch;
-        juce::Slider inTrimSlider, outTrimSlider, tunerRefSlider;
+        juce::Slider inTrimSlider, outTrimSlider, tunerRefSlider, tempoBpmSlider;
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inTrimAtt, outTrimAtt;
         settings_ui::HorizontalPeakBar inMeter, outMeter;
-        juce::TextButton btn432, btn440, btn442, resetDspBtn;
+        juce::TextButton btn432, btn440, btn442, tapTempoBtn, resetDspBtn;
     };
 
     // =========================================================================
@@ -1910,17 +1934,35 @@ private:
                 PedalBoardAudioProcessor::getStudioSettingsFile().getParentDirectory().revealToUser();
             };
 
-            for (juce::Component* c : { &openPresetsBtn, &openCloudBtn, &openCacheBtn, &clearCacheBtn, &openConfigBtn }) {
+            openPacksBtn.setButtonText("OPEN PACKS");
+            openPacksBtn.setTooltip("Open local override ModelPacks folder (%APPDATA%\\PedalBoard\\ModelPacks\\)");
+            openPacksBtn.onClick = [] {
+                ModelPackRegistry::getUserOverrideDirectory().revealToUser();
+            };
+
+            rescanPacksBtn.setButtonText("RESCAN PACKS");
+            rescanPacksBtn.setTooltip("Rescan bundled & local ModelPacks and immediately refresh active Amps, Cabs & Pedals");
+            rescanPacksBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff0284c7));
+            rescanPacksBtn.onClick = [this] {
+                owner.processor.getSignalChain().refreshAllModelPacks();
+                refreshStorageStats();
+            };
+
+            for (juce::Component* c : std::initializer_list<juce::Component*>{
+                     &openPresetsBtn, &openPacksBtn, &rescanPacksBtn, &openCloudBtn, &openCacheBtn, &clearCacheBtn, &openConfigBtn }) {
                 addAndMakeVisible(*c);
             }
         }
 
-        int computePreferredHeight() const { return 570; }
+        int computePreferredHeight() const { return 694; }
 
         void refreshStorageStats() {
             const auto presetDir = owner.processor.getPresetManager().getUserPresetDirectory();
             presetPathStr = presetDir.getFullPathName();
             userPresetCount = presetDir.findChildFiles(juce::File::findFiles, true, "*.pbpreset").size();
+
+            packPathStr = ModelPackRegistry::getUserOverrideDirectory().getFullPathName();
+            packStats = ModelPackRegistry::instance().getStats();
 
             const auto cacheDir = t3k::Tone3000Client::getCacheDirectory();
             cachePathStr = cacheDir.getFullPathName();
@@ -1953,7 +1995,22 @@ private:
             drawPathBox(g, presetBoxRect, presetPathStr,
                         juce::String(userPresetCount) + (userPresetCount == 1 ? " user preset saved" : " user presets saved"));
 
-            // Card 2: TONE3000 Cloud & Offline Cache
+            // Card 2: Bundled & Local ModelPacks (Lazy-Loaded NAM & IR Pack)
+            drawCardFrame(g, packsCardRect, "BUNDLED & LOCAL MODEL PACKS (LAZY-LOADED)",
+                          "Drop 3-digit numbered .nam/.wav files (e.g. 062_Dark_Twin.nam, 146_UK_LD.wav) to auto-bind any GP-200 slot.");
+            {
+                const double archiveMb = static_cast<double>(packStats.embeddedArchiveBytes) / (1024.0 * 1024.0);
+                const juce::String summary =
+                    juce::String(packStats.totalMapped) + " / 193 mapped  |  Bundled: " + juce::String(packStats.bundledCount)
+                    + " (" + juce::String(archiveMb, 1) + " MB)  |  Local: " + juce::String(packStats.localOverrideCount)
+                    + "   [Amp:" + juce::String(packStats.ampMapped)
+                    + " Cab:" + juce::String(packStats.cabMapped)
+                    + " Pedal:" + juce::String(packStats.pedalMapped)
+                    + " Rvb:" + juce::String(packStats.reverbMapped) + "]";
+                drawPathBox(g, packsBoxRect, packPathStr, summary);
+            }
+
+            // Card 3: TONE3000 Cloud & Offline Cache
             drawCardFrame(g, cloudCardRect, "TONE3000 CLOUD & OFFLINE CAPTURE CACHE",
                           "Downloaded .nam neural captures and .wav cabinet IRs stay cached locally for instant offline loading.");
             {
@@ -2031,6 +2088,18 @@ private:
             }
 
             area.removeFromTop(14);
+            packsCardRect = area.removeFromTop(110);
+            {
+                auto in = packsCardRect.reduced(14, 12);
+                in.removeFromTop(38);
+                rescanPacksBtn.setBounds(in.removeFromRight(108).withHeight(34));
+                in.removeFromRight(6);
+                openPacksBtn.setBounds(in.removeFromRight(96).withHeight(34));
+                in.removeFromRight(8);
+                packsBoxRect = in.withHeight(38);
+            }
+
+            area.removeFromTop(14);
             cloudCardRect = area.removeFromTop(162);
             {
                 auto in = cloudCardRect.reduced(14, 12);
@@ -2100,11 +2169,12 @@ private:
         }
 
         StudioSettingsContent& owner;
-        juce::Rectangle<int> presetsCardRect, cloudCardRect, diagCardRect;
-        juce::Rectangle<int> presetBoxRect, cloudAcctRect, cacheBoxRect, configBoxRect;
+        juce::Rectangle<int> presetsCardRect, packsCardRect, cloudCardRect, diagCardRect;
+        juce::Rectangle<int> presetBoxRect, packsBoxRect, cloudAcctRect, cacheBoxRect, configBoxRect;
 
-        juce::TextButton openPresetsBtn, openCloudBtn, openCacheBtn, clearCacheBtn, openConfigBtn;
-        juce::String presetPathStr, cachePathStr, configPathStr, cloudAccountText;
+        juce::TextButton openPresetsBtn, openPacksBtn, rescanPacksBtn, openCloudBtn, openCacheBtn, clearCacheBtn, openConfigBtn;
+        juce::String presetPathStr, packPathStr, cachePathStr, configPathStr, cloudAccountText;
+        ModelPackStats packStats {};
         int userPresetCount = 0;
         int cachedFileCount = 0;
         double cacheSizeMb = 0.0;

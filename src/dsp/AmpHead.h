@@ -1,10 +1,14 @@
 #pragma once
 
+#include "../engine/Gp200Catalogue.h"
+#include "../engine/ModelPackRegistry.h"
 #include "BiquadFilter.h"
 #include "NamModelRunner.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <juce_dsp/juce_dsp.h>
+#include <juce_events/juce_events.h>
 
 namespace pedalboard {
 
@@ -19,8 +23,12 @@ namespace pedalboard {
 // - 64..68: Bass Amps (Ampeg SVT, VOX AC-100 Bass, Mesa Bass 400, Ampeg B-15, Alembic F-2B)
 // - 69..70: Acoustic Preamps (AER Colourizer AC Pre 1 & 2)
 // - 71:     Neural NAM Capture (.nam deep-learning model runner)
-class AmpHead {
+// Supports lazy auto-loading from bundled ModelPacks.zip & local overrides for all 71 models!
+class AmpHead : private juce::AsyncUpdater {
 public:
+    ~AmpHead() override {
+        cancelPendingUpdate();
+    }
     struct Params {
         bool bypass = false;
         int channel = 1;       // Legacy 0..3 category (0=Clean, 1=Crunch, 2=High-Gain, 3=NAM)
@@ -45,6 +53,10 @@ public:
         powerLpf.setLowPass(sampleRate, 9500.0, 0.707);
 
         namRunner.prepare(sampleRate, static_cast<int>(spec.maximumBlockSize));
+        packNamRunner.prepare(sampleRate, static_cast<int>(spec.maximumBlockSize));
+        loadedPackModelIdx.store(-1, std::memory_order_release);
+        observedRegistryVer.store(0, std::memory_order_release);
+        packActiveForCurrentModel.store(false, std::memory_order_release);
 
         invalidateCache();
         reset();
@@ -61,10 +73,27 @@ public:
         presenceFilter.reset();
         powerLpf.reset();
         namRunner.reset();
+        packNamRunner.reset();
     }
 
     NamModelRunner& getNamRunner() noexcept { return namRunner; }
     const NamModelRunner& getNamRunner() const noexcept { return namRunner; }
+    NamModelRunner& getPackNamRunner() noexcept { return packNamRunner; }
+    const NamModelRunner& getPackNamRunner() const noexcept { return packNamRunner; }
+
+    bool isUsingPackNam() const noexcept {
+        return packActiveForCurrentModel.load(std::memory_order_acquire) && packNamRunner.hasLoadedModel();
+    }
+
+    juce::String getPackNamDisplayName() const {
+        return packNamRunner.getDisplayName();
+    }
+
+    void requestPackRefresh() {
+        observedRegistryVer.store(0, std::memory_order_release);
+        packReloadPending.store(true, std::memory_order_release);
+        triggerAsyncUpdate();
+    }
 
     // Map legacy 4-channel tab index (0..3) to representative GP-200 model index
     static int defaultModelForChannel(int ch) noexcept {
@@ -129,8 +158,26 @@ public:
             return;
         }
 
+        // Strictly lock-free lazy check for bundled/local ModelPack .nam for GP-200 Amp models (0..70)
+        const uint64_t regVer = ModelPackRegistry::instance().getVersion();
+        if (m != loadedPackModelIdx.load(std::memory_order_acquire)
+            || regVer != observedRegistryVer.load(std::memory_order_acquire)) {
+            const int prevReq = requestedPackModelIdx.exchange(m, std::memory_order_acq_rel);
+            const bool alreadyPending = packReloadPending.exchange(true, std::memory_order_acq_rel);
+            if (!alreadyPending || prevReq != m) {
+                triggerAsyncUpdate();
+            }
+        }
+
+        const bool usePackNam = (m == loadedPackModelIdx.load(std::memory_order_acquire))
+                             && packActiveForCurrentModel.load(std::memory_order_acquire)
+                             && packNamRunner.hasLoadedModel();
+
         // Special handling for AER Colourizer Acoustic Preamps (69: AC Pre, 70: AC Pre 2)
         if (m == 69 || m == 70) {
+            if (usePackNam) {
+                packNamRunner.process(buffer, 1.0f);
+            }
             const float balanceWet = std::clamp(p.extra / 10.0f, 0.0f, 1.0f);
             const float masterGain = juce::Decibels::decibelsToGain(-18.0f + (std::clamp(p.master, 0.0f, 10.0f) / 10.0f) * 24.0f);
             for (int ch = 0; ch < numChannels; ++ch) {
@@ -144,6 +191,36 @@ public:
                 }
             }
             return;
+        }
+
+        // Bundled/Local ModelPack Neural NAM Capture for GP-200 Amp 0..68 + Authentic Per-Amp Tone Stack!
+        if (usePackNam) {
+            float effGain = std::clamp(p.gain, 0.0f, 10.0f);
+            if (m == 8 || m == 35 || m == 38) {
+                effGain = std::clamp(effGain * 0.62f + std::clamp(p.extra, 0.0f, 10.0f) * 0.55f, 0.0f, 10.0f);
+            } else if (m == 16) {
+                effGain = std::clamp(effGain * 0.72f + std::clamp(p.extra, 0.0f, 10.0f) * 0.42f, 0.0f, 10.0f);
+            } else if (m == 11 && p.switchVal >= 1) {
+                effGain = std::clamp(effGain * 1.15f + 1.0f, 0.0f, 10.0f);
+            } else if (m == 65 || m == 67 || m == 68) {
+                effGain = 5.0f;
+            }
+            const float driveDb = (effGain - 5.0f) * 2.8f;
+            const float inputDrive = juce::Decibels::decibelsToGain(driveDb);
+            if (packNamRunner.process(buffer, inputDrive)) {
+                const float masterGain = juce::Decibels::decibelsToGain(-18.0f + (std::clamp(p.master, 0.0f, 10.0f) / 10.0f) * 24.0f);
+                for (int ch = 0; ch < numChannels; ++ch) {
+                    float* data = buffer.getWritePointer(ch);
+                    for (int i = 0; i < numSamples; ++i) {
+                        float s = bassFilter.processSample(ch, data[i]);
+                        s = midFilter.processSample(ch, s);
+                        s = trebleFilter.processSample(ch, s);
+                        s = presenceFilter.processSample(ch, s);
+                        data[i] = std::tanh(s * masterGain * 0.95f);
+                    }
+                }
+                return;
+            }
         }
 
         // Pre-EQ & tight input HPF tailored to the active GP-200 amp model
@@ -373,6 +450,35 @@ private:
         presenceFilter.setHighShelf(sampleRate, isToneCutAmp ? 3400.0 : presHz, presDb, 0.9);
     }
 
+    void handleAsyncUpdate() override {
+        if (!packReloadPending.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+        const int target = requestedPackModelIdx.load(std::memory_order_acquire);
+        const uint64_t regVer = ModelPackRegistry::instance().getVersion();
+        if (target < 0 || target >= 71) {
+            observedRegistryVer.store(regVer, std::memory_order_release);
+            return;
+        }
+        if (target == loadedPackModelIdx.load(std::memory_order_acquire)
+            && regVer == observedRegistryVer.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        const auto& entry = gp200::getModelEntry(ModuleId::AmpHead, target);
+        auto asset = ModelPackRegistry::instance().loadCaptureBytes(entry.excelNo, false);
+        observedRegistryVer.store(regVer, std::memory_order_release);
+        loadedPackModelIdx.store(target, std::memory_order_release);
+
+        if (asset.has_value()) {
+            packActiveForCurrentModel.store(true, std::memory_order_release);
+            packNamRunner.loadModelFromMemoryAsync(std::move(asset->bytes), asset->displayName, asset->originLabel);
+        } else {
+            packActiveForCurrentModel.store(false, std::memory_order_release);
+            packNamRunner.clearModel();
+        }
+    }
+
     double sampleRate = 44100.0;
     int lastModel = -1;
     int lastSwitch = -1;
@@ -381,6 +487,12 @@ private:
     float vStage1Min = 2.5f, vStage1Span = 18.0f;
     float vStage2Min = 1.8f, vStage2Span = 4.5f;
     float vAsymBias = 0.14f, vStage2Scale = 0.80f;
+
+    std::atomic<int> loadedPackModelIdx { -1 };
+    std::atomic<int> requestedPackModelIdx { -1 };
+    std::atomic<uint64_t> observedRegistryVer { 0 };
+    std::atomic<bool> packReloadPending { false };
+    std::atomic<bool> packActiveForCurrentModel { false };
 
     juce::dsp::Oversampling<float> oversampling {
         2, 2, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true
@@ -394,6 +506,7 @@ private:
     BiquadFilter presenceFilter;
     BiquadFilter powerLpf;
     NamModelRunner namRunner;
+    NamModelRunner packNamRunner;
 };
 
 } // namespace pedalboard

@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <juce_audio_basics/juce_audio_basics.h>
@@ -19,6 +20,7 @@
   #endif
   #include <NAM/dsp.h>
   #include <NAM/get_dsp.h>
+  #include <json.hpp>
   #if defined(_MSC_VER)
     #pragma warning(pop)
   #endif
@@ -27,16 +29,17 @@
 namespace pedalboard {
 
 // Real-time safe wrapper around NeuralAmpModelerCore v0.6.0.
-// Loads and prewarms .nam neural captures off the audio thread, atomically swaps models,
-// and resamples transparently when host sample rate differs from model training rate.
+// Supports both disk .nam files AND zero-temp-file in-memory JSON loading (from bundled ModelPacks.zip).
+// Uses generation counters to discard superseded async loads cleanly and swaps pointers atomically.
 class NamModelRunner {
 public:
     NamModelRunner() = default;
 
     ~NamModelRunner() {
 #if defined(PEDALBOARD_HAS_NAM) && PEDALBOARD_HAS_NAM
-        // Wait briefly if a background load is still finishing, then clean up models safely
-        while (loadingInProgress.load(std::memory_order_acquire)) {
+        // Invalidate any in-flight async loads and wait briefly for background workers to exit safely
+        loadGeneration.fetch_add(1, std::memory_order_acq_rel);
+        while (activeLoadJobs.load(std::memory_order_acquire) > 0) {
             juce::Thread::sleep(5);
         }
         delete activeModel;
@@ -83,22 +86,22 @@ public:
             return;
         }
 
-        // Collect any previously retired audio-thread models safely on the caller thread
         reclaimRetired();
 
         const double sr = hostSampleRate.load(std::memory_order_relaxed);
         const int maxBlock = hostMaxBlockSize.load(std::memory_order_relaxed);
         const auto pathStr = file.getFullPathName();
         const auto fileName = file.getFileNameWithoutExtension();
+        const uint64_t gen = loadGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         {
             std::lock_guard<std::mutex> lock(metaMutex);
             statusText = "Loading " + fileName + "...";
         }
 
-        loadingInProgress.store(true, std::memory_order_release);
+        activeLoadJobs.fetch_add(1, std::memory_order_acq_rel);
 
-        juce::Thread::launch([this, pathStr, fileName, sr, maxBlock, cb = std::move(onDone)]() mutable {
+        juce::Thread::launch([this, gen, pathStr, fileName, sr, maxBlock, cb = std::move(onDone)]() mutable {
             bool ok = false;
             juce::String errMsg;
             std::unique_ptr<nam::DSP> loaded;
@@ -110,15 +113,12 @@ public:
                 loaded = nam::get_dsp(fsPath);
                 if (loaded != nullptr) {
                     expectedSr = loaded->GetExpectedSampleRate();
-                    if (expectedSr <= 0.0) {
-                        expectedSr = sr;
-                    }
+                    if (expectedSr <= 0.0) expectedSr = sr;
                     const int modelMaxBlock = std::max(512, static_cast<int>(std::ceil(maxBlock * (expectedSr / sr))) + 64);
                     loaded->Reset(expectedSr, modelMaxBlock);
 
                     if (loaded->HasLoudness()) {
-                        const double targetLoudness = -18.0;
-                        const double gainDb = std::clamp(targetLoudness - loaded->GetLoudness(), -24.0, 24.0);
+                        const double gainDb = std::clamp(-18.0 - loaded->GetLoudness(), -24.0, 24.0);
                         loudnessNormGain = static_cast<float>(juce::Decibels::decibelsToGain(gainDb));
                     }
                     ok = true;
@@ -129,33 +129,19 @@ public:
                 errMsg = "Unknown error loading .nam model";
             }
 
-            if (ok && loaded != nullptr) {
-                auto* wrapper = new LoadedModel();
-                wrapper->dsp = std::move(loaded);
-                wrapper->modelSampleRate = expectedSr;
-                wrapper->loudnessGain = loudnessNormGain;
-
-                auto* prevPending = pendingModel.exchange(wrapper, std::memory_order_acq_rel);
-                if (prevPending != nullptr) {
-                    std::lock_guard<std::mutex> gLock(garbageMutex);
-                    garbageBin.emplace_back(prevPending);
-                }
-
-                {
+            const bool stillCurrent = (loadGeneration.load(std::memory_order_acquire) == gen);
+            if (stillCurrent) {
+                if (ok && loaded != nullptr) {
+                    installLoadedModel(std::move(loaded), expectedSr, loudnessNormGain, pathStr, fileName, {});
+                } else {
                     std::lock_guard<std::mutex> lock(metaMutex);
-                    currentModelPath = pathStr;
-                    displayName = fileName;
-                    statusText = fileName + " (" + juce::String(static_cast<int>(std::lround(expectedSr / 1000.0))) + "kHz)";
+                    statusText = errMsg.isNotEmpty() ? ("Load failed: " + errMsg) : "Load failed";
                 }
-                modelLoadedFlag.store(true, std::memory_order_release);
-            } else {
-                std::lock_guard<std::mutex> lock(metaMutex);
-                statusText = errMsg.isNotEmpty() ? ("Load failed: " + errMsg) : "Load failed";
             }
 
-            loadingInProgress.store(false, std::memory_order_release);
+            activeLoadJobs.fetch_sub(1, std::memory_order_acq_rel);
             if (cb) {
-                juce::MessageManager::callAsync([cb = std::move(cb), ok] { cb(ok); });
+                juce::MessageManager::callAsync([cb = std::move(cb), ok, stillCurrent] { cb(ok && stillCurrent); });
             }
         });
 #else
@@ -164,8 +150,86 @@ public:
 #endif
     }
 
+    // Zero-temp-file in-memory loader used by ModelPackRegistry lazy ZIP extraction!
+    void loadModelFromMemoryAsync(juce::MemoryBlock rawJsonBytes,
+                                  const juce::String& name,
+                                  const juce::String& originTag = {},
+                                  std::function<void(bool)> onDone = {}) {
+#if defined(PEDALBOARD_HAS_NAM) && PEDALBOARD_HAS_NAM
+        if (rawJsonBytes.getSize() == 0) {
+            if (onDone) onDone(false);
+            return;
+        }
+
+        reclaimRetired();
+
+        const double sr = hostSampleRate.load(std::memory_order_relaxed);
+        const int maxBlock = hostMaxBlockSize.load(std::memory_order_relaxed);
+        const auto safeName = name.isNotEmpty() ? name : juce::String("Bundled NAM");
+        const uint64_t gen = loadGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+        {
+            std::lock_guard<std::mutex> lock(metaMutex);
+            statusText = "Loading " + safeName + "...";
+        }
+
+        activeLoadJobs.fetch_add(1, std::memory_order_acq_rel);
+
+        juce::Thread::launch([this, gen, data = std::move(rawJsonBytes), safeName, originTag, sr, maxBlock, cb = std::move(onDone)]() mutable {
+            bool ok = false;
+            juce::String errMsg;
+            std::unique_ptr<nam::DSP> loaded;
+            double expectedSr = 48000.0;
+            float loudnessNormGain = 1.0f;
+
+            try {
+                const auto* beginPtr = static_cast<const char*>(data.getData());
+                const auto* endPtr   = beginPtr + data.getSize();
+                const nlohmann::json config = nlohmann::json::parse(beginPtr, endPtr);
+                nam::dspData returnedConfig;
+                loaded = nam::get_dsp(config, returnedConfig);
+                if (loaded != nullptr) {
+                    expectedSr = loaded->GetExpectedSampleRate();
+                    if (expectedSr <= 0.0) expectedSr = sr;
+                    const int modelMaxBlock = std::max(512, static_cast<int>(std::ceil(maxBlock * (expectedSr / sr))) + 64);
+                    loaded->Reset(expectedSr, modelMaxBlock);
+
+                    if (loaded->HasLoudness()) {
+                        const double gainDb = std::clamp(-18.0 - loaded->GetLoudness(), -24.0, 24.0);
+                        loudnessNormGain = static_cast<float>(juce::Decibels::decibelsToGain(gainDb));
+                    }
+                    ok = true;
+                }
+            } catch (const std::exception& e) {
+                errMsg = e.what();
+            } catch (...) {
+                errMsg = "Unknown error parsing in-memory .nam model";
+            }
+
+            const bool stillCurrent = (loadGeneration.load(std::memory_order_acquire) == gen);
+            if (stillCurrent) {
+                if (ok && loaded != nullptr) {
+                    installLoadedModel(std::move(loaded), expectedSr, loudnessNormGain, {}, safeName, originTag);
+                } else {
+                    std::lock_guard<std::mutex> lock(metaMutex);
+                    statusText = errMsg.isNotEmpty() ? ("Load failed: " + errMsg) : "Load failed";
+                }
+            }
+
+            activeLoadJobs.fetch_sub(1, std::memory_order_acq_rel);
+            if (cb) {
+                juce::MessageManager::callAsync([cb = std::move(cb), ok, stillCurrent] { cb(ok && stillCurrent); });
+            }
+        });
+#else
+        juce::ignoreUnused(rawJsonBytes, name, originTag);
+        if (onDone) onDone(false);
+#endif
+    }
+
     void clearModel() {
 #if defined(PEDALBOARD_HAS_NAM) && PEDALBOARD_HAS_NAM
+        loadGeneration.fetch_add(1, std::memory_order_acq_rel);
         auto* sentinel = new LoadedModel(); // empty dsp pointer signals clear
         auto* prevPending = pendingModel.exchange(sentinel, std::memory_order_acq_rel);
         if (prevPending != nullptr) {
@@ -198,6 +262,11 @@ public:
         return statusText;
     }
 
+    juce::String getShortName() const {
+        std::lock_guard<std::mutex> lock(metaMutex);
+        return displayName;
+    }
+
     juce::String getModelPath() const {
         std::lock_guard<std::mutex> lock(metaMutex);
         return currentModelPath;
@@ -216,12 +285,10 @@ public:
     // Strictly real-time safe: zero locks, zero heap allocations, zero deletes.
     bool process(juce::AudioBuffer<float>& buffer, float inputDriveGain) noexcept {
 #if defined(PEDALBOARD_HAS_NAM) && PEDALBOARD_HAS_NAM
-        // Atomically check for newly loaded model from background thread
         if (auto* incoming = pendingModel.exchange(nullptr, std::memory_order_acq_rel)) {
             auto* old = activeModel;
             activeModel = (incoming->dsp != nullptr) ? incoming : nullptr;
             if (incoming->dsp == nullptr) {
-                // Hand back empty sentinel for deletion off audio thread
                 auto* prevRet = retiredModel.exchange(incoming, std::memory_order_acq_rel);
                 juce::ignoreUnused(prevRet);
             }
@@ -268,7 +335,6 @@ public:
                 }
             }
         } else {
-            // Resample mono input hostSr -> modelSr -> process NAM -> resample modelSr -> hostSr
             for (int i = 0; i < numSamples; ++i) {
                 const float mono = srcR != nullptr ? 0.5f * (srcL[i] + srcR[i]) : srcL[i];
                 resampleInF[static_cast<size_t>(i)] = mono * inputDriveGain;
@@ -320,10 +386,40 @@ private:
         float loudnessGain = 1.0f;
     };
 
+    void installLoadedModel(std::unique_ptr<nam::DSP> loaded,
+                            double expectedSr,
+                            float loudnessNormGain,
+                            const juce::String& pathStr,
+                            const juce::String& name,
+                            const juce::String& originTag) {
+        auto* wrapper = new LoadedModel();
+        wrapper->dsp = std::move(loaded);
+        wrapper->modelSampleRate = expectedSr;
+        wrapper->loudnessGain = loudnessNormGain;
+
+        auto* prevPending = pendingModel.exchange(wrapper, std::memory_order_acq_rel);
+        if (prevPending != nullptr) {
+            std::lock_guard<std::mutex> gLock(garbageMutex);
+            garbageBin.emplace_back(prevPending);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(metaMutex);
+            currentModelPath = pathStr;
+            displayName = name;
+            const auto srTag = juce::String(static_cast<int>(std::lround(expectedSr / 1000.0))) + "kHz";
+            statusText = originTag.isNotEmpty()
+                ? (name + " [" + originTag + " · " + srTag + "]")
+                : (name + " (" + srTag + ")");
+        }
+        modelLoadedFlag.store(true, std::memory_order_release);
+    }
+
     LoadedModel* activeModel = nullptr;
     std::atomic<LoadedModel*> pendingModel { nullptr };
     std::atomic<LoadedModel*> retiredModel { nullptr };
-    std::atomic<bool> loadingInProgress { false };
+    std::atomic<uint64_t> loadGeneration { 0 };
+    std::atomic<int> activeLoadJobs { 0 };
     std::mutex garbageMutex;
     std::vector<std::unique_ptr<LoadedModel>> garbageBin;
 #endif

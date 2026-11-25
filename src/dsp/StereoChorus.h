@@ -1,6 +1,7 @@
 #pragma once
 
 #include "BiquadFilter.h"
+#include "TempoSync.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -10,10 +11,12 @@
 namespace pedalboard {
 
 // GP-200 MOD Module (All 24 Modulation Models from Daftar_Effect_GP-200.xlsx rows 209..232)
-// Supports every authentic per-model control: C-Chorus 4-Mode, M-Chorus Depth L/C/R + Filter,
-// Jet Pre Delay + Feedback, Trem Jet dual LFO, S-Phase Warm/Sharp, Pan Phase dual LFO,
-// Vibe Chorus/Vibrato, Bias Trem Bias, Detune cents + Dry/Wet, Bit Smash Krush/Bit/Hi/Lo Cut,
-// Auto Swell Attack + Line/Exp/Log curve.
+// White-Box Analog Circuit DSP Upgrades:
+// - O-Phase (#220 MXR Phase 90): 4-stage cascaded JFET 1st-order all-pass network + feedback mid-bump + JFET warmth
+// - S-Phase (#222 EHX Small Stone): 4-stage OTA cascaded all-pass + Warm/Sharp resonant Color feedback loop
+// - Vibe (#225 Shin-Ei Uni-Vibe) & M-Vibe (#224): Staggered-capacitor 4-stage asymmetric all-pass + incandescent bulb/CdS photocell lag!
+// - C-Chorus (#210 Boss Dimension C): Opposing triangle-LFO dual-BBD cross-coupled spatial matrix (zero pitch wobble!)
+// - G-Chorus / G-Roto (#209/#218 Boss CE-1): MN3002 BBD pre/de-emphasis + warm preamp grit + classic dry/inverted-wet stereo field
 class StereoChorus {
 public:
     struct Params {
@@ -26,6 +29,7 @@ public:
 
         bool useSlotParams = false;
         std::array<float, 12> slotParams {};
+        float tempoBpm = 120.0f;
     };
 
     void prepare(const juce::dsp::ProcessSpec& spec) {
@@ -40,6 +44,9 @@ public:
         delayC.prepare(spec);
 
         wetTone.setLowPass(sampleRate, 6200.0, 0.707);
+        bbdPreEmph.setHighShelf(sampleRate, 2200.0, 4.5, 0.72);
+        bbdDeEmph.setHighShelf(sampleRate, 2200.0, -4.5, 0.72);
+        bbdAntiAlias.setLowPass(sampleRate, 4600.0, 0.707);
         bassHpf.setHighPass(sampleRate, 180.0, 0.707);
         crushLpf.setLowPass(sampleRate, 8500.0, 0.707);
         crushHpf.setHighPass(sampleRate, 80.0, 0.707);
@@ -51,11 +58,18 @@ public:
         delayR.reset();
         delayC.reset();
         wetTone.reset();
+        bbdPreEmph.reset();
+        bbdDeEmph.reset();
+        bbdAntiAlias.reset();
         bassHpf.reset();
         crushLpf.reset();
         crushHpf.reset();
-        phaserPeak1.reset();
-        phaserPeak2.reset();
+        for (auto& st : apStateL) st = 0.0f;
+        for (auto& st : apStateR) st = 0.0f;
+        for (auto& st : apPrevInL) st = 0.0f;
+        for (auto& st : apPrevInR) st = 0.0f;
+        apFbL = apFbR = 0.0f;
+        vibeLampEnv = 0.5f;
         lfoPhase = 0.0;
         lfoPhase2 = 0.0;
         fbL = fbR = 0.0f;
@@ -94,51 +108,70 @@ public:
             switch (m) {
                 case 1: { // C-Chorus (Boss Dimension C): Mode 1..4
                     modeChoice = std::clamp(static_cast<int>(std::lround(sp[0])), 0, 3);
-                    constexpr float kDimRate[4]  = { 0.42f, 0.72f, 1.15f, 1.85f };
-                    constexpr float kDimDepth[4] = { 0.30f, 0.50f, 0.72f, 0.92f };
-                    constexpr float kDimMix[4]   = { 0.42f, 0.50f, 0.58f, 0.68f };
+                    constexpr float kDimRate[4]  = { 0.34f, 0.58f, 0.92f, 1.48f };
+                    constexpr float kDimDepth[4] = { 0.32f, 0.52f, 0.74f, 0.94f };
+                    constexpr float kDimMix[4]   = { 0.42f, 0.52f, 0.62f, 0.72f };
                     rateHz = kDimRate[modeChoice];
                     depth  = kDimDepth[modeChoice];
                     wet    = kDimMix[modeChoice];
-                    preDelayMs = 8.5f;
+                    preDelayMs = 7.8f + static_cast<float>(modeChoice) * 1.1f;
                     break;
                 }
                 case 2: // B-Chorus: Depth, Rate, Mix, Sync
-                    depth = sp[0] * 0.01f; rateHz = sp[1]; wet = sp[2] * 0.01f; preDelayMs = 9.0f;
+                    depth = sp[0] * 0.01f;
+                    rateHz = (sp[3] > 0.5f) ? tempo_sync::syncedModRateHz(sp[1], 0.1f, 6.0f, p.tempoBpm) : sp[1];
+                    wet = sp[2] * 0.01f; preDelayMs = 9.0f;
                     break;
                 case 3: // M-Chorus: Mix, Rate, Filter, Depth L/C/R, Sync
-                    wet = sp[0] * 0.01f; rateHz = sp[1];
+                    wet = sp[0] * 0.01f;
+                    rateHz = (sp[6] > 0.5f) ? tempo_sync::syncedModRateHz(sp[1], 0.1f, 6.0f, p.tempoBpm) : sp[1];
                     wetTone.setLowPass(sampleRate, 1800.0 + static_cast<double>(sp[2]) * 950.0, 0.72);
                     depth = sp[3] * 0.01f;
                     preDelayMs = 11.0f;
                     break;
                 case 4: case 5: case 6: // Jet, B-Jet, N-Jet: Depth, Rate, Pre Delay, Feedback, Sync
-                    depth = sp[0] * 0.01f; rateHz = sp[1]; preDelayMs = sp[2]; fbAmt = sp[3] * 0.01f; wet = 0.55f;
+                    depth = sp[0] * 0.01f;
+                    rateHz = (sp[4] > 0.5f) ? tempo_sync::syncedModRateHz(sp[1], 0.05f, 5.0f, p.tempoBpm) : sp[1];
+                    preDelayMs = sp[2]; fbAmt = sp[3] * 0.01f; wet = 0.55f;
                     break;
                 case 7: // Trem Jet: Flg Depth, Flg Rate, Feedback, Trm Depth, Trm Rate, Flg Sync, Trm Sync
-                    depth = sp[0] * 0.01f; rateHz = sp[1]; fbAmt = sp[2] * 0.01f;
-                    depth2 = sp[3] * 0.01f; rate2Hz = sp[4]; preDelayMs = 3.2f; wet = 0.55f;
+                    depth = sp[0] * 0.01f;
+                    rateHz = (sp[5] > 0.5f) ? tempo_sync::syncedModRateHz(sp[1], 0.05f, 5.0f, p.tempoBpm) : sp[1];
+                    fbAmt = sp[2] * 0.01f;
+                    depth2 = sp[3] * 0.01f;
+                    rate2Hz = (sp[6] > 0.5f) ? tempo_sync::syncedModRateHz(sp[4], 0.5f, 10.0f, p.tempoBpm) : sp[4];
+                    preDelayMs = 3.2f; wet = 0.55f;
                     break;
                 case 8: case 12: case 15: case 17: // V-Roto, G-Phase, M-Vibe, O-Trem: Depth, Rate, Sync
-                    depth = sp[0] * 0.01f; rateHz = sp[1]; wet = (m == 8) ? 1.0f : 0.75f;
+                    depth = sp[0] * 0.01f;
+                    rateHz = (sp[2] > 0.5f) ? tempo_sync::syncedModRateHz(sp[1], 0.1f, 8.0f, p.tempoBpm) : sp[1];
+                    wet = (m == 8) ? 1.0f : 0.75f;
                     break;
-                case 11: // O-Phase (Phase 90): Rate, Sync
-                    rateHz = sp[0]; depth = 0.75f; wet = 0.72f;
+                case 11: // O-Phase (MXR Phase 90): Rate, Sync
+                    rateHz = (sp[1] > 0.5f) ? tempo_sync::syncedModRateHz(sp[0], 0.1f, 8.0f, p.tempoBpm) : sp[0];
+                    depth = 0.85f; wet = 0.74f;
                     break;
-                case 13: // S-Phase (Small Stone): Rate, Color (Warm/Sharp), Sync
-                    rateHz = sp[0]; modeChoice = static_cast<int>(std::lround(sp[1])); depth = 0.80f; wet = 0.78f;
+                case 13: // S-Phase (EHX Small Stone): Rate, Color (Warm/Sharp), Sync
+                    rateHz = (sp[2] > 0.5f) ? tempo_sync::syncedModRateHz(sp[0], 0.1f, 8.0f, p.tempoBpm) : sp[0];
+                    modeChoice = static_cast<int>(std::lround(sp[1])); depth = 0.90f; wet = 0.78f;
                     break;
-                case 14: // Pan Phase: Phs Depth, Phs Rate, Pan Depth, Pan Rate
-                    depth = sp[0] * 0.01f; rateHz = sp[1]; depth2 = sp[2] * 0.01f; rate2Hz = sp[3]; wet = 0.78f;
+                case 14: // Pan Phase: Phs Depth, Phs Rate, Pan Depth, Pan Rate, Phs Sync, Pan Sync
+                    depth = sp[0] * 0.01f;
+                    rateHz = (sp[4] > 0.5f) ? tempo_sync::syncedModRateHz(sp[1], 0.1f, 6.0f, p.tempoBpm) : sp[1];
+                    depth2 = sp[2] * 0.01f;
+                    rate2Hz = (sp[5] > 0.5f) ? tempo_sync::syncedModRateHz(sp[3], 0.2f, 8.0f, p.tempoBpm) : sp[3];
+                    wet = 0.78f;
                     break;
-                case 16: // Vibe: Depth, Rate, Volume, Mode (Chorus/Vibrato), Sync
-                    depth = sp[0] * 0.01f; rateHz = sp[1];
+                case 16: // Vibe (Shin-Ei Uni-Vibe): Depth, Rate, Volume, Mode (Chorus/Vibrato), Sync
+                    depth = sp[0] * 0.01f;
+                    rateHz = (sp[4] > 0.5f) ? tempo_sync::syncedModRateHz(sp[1], 0.2f, 8.0f, p.tempoBpm) : sp[1];
                     outVol = juce::Decibels::decibelsToGain(-12.0f + sp[2] * 1.85f);
                     modeChoice = static_cast<int>(std::lround(sp[3]));
-                    wet = (modeChoice == 1) ? 1.0f : 0.72f;
+                    wet = (modeChoice == 1) ? 1.0f : 0.76f;
                     break;
                 case 20: // Bias Trem: Depth, Rate, Volume, Bias, Sync
-                    depth = sp[0] * 0.01f; rateHz = sp[1];
+                    depth = sp[0] * 0.01f;
+                    rateHz = (sp[4] > 0.5f) ? tempo_sync::syncedModRateHz(sp[1], 0.5f, 10.0f, p.tempoBpm) : sp[1];
                     outVol = juce::Decibels::decibelsToGain(-12.0f + sp[2] * 1.85f);
                     biasAmt = std::clamp(sp[3] * 0.01f, 0.0f, 1.0f);
                     wet = 1.0f;
@@ -159,10 +192,11 @@ public:
                     modeChoice = std::clamp(static_cast<int>(std::lround(sp[1])), 0, 2);
                     wet = 1.0f;
                     break;
-                default: // 0:G-Chorus, 9:G-Roto, 10:Vibrato, 18:Sine Trem, 19:Triangle Trem: Depth, Rate, Volume, Sync
-                    depth = sp[0] * 0.01f; rateHz = sp[1];
+                default: // 0:G-Chorus (CE-1), 9:G-Roto (CE-1 Vib), 10:Vibrato, 18:Sine Trem, 19:Triangle Trem
+                    depth = sp[0] * 0.01f;
+                    rateHz = (sp[3] > 0.5f) ? tempo_sync::syncedModRateHz(sp[1], 0.1f, 8.0f, p.tempoBpm) : sp[1];
                     outVol = juce::Decibels::decibelsToGain(-12.0f + sp[2] * 1.85f);
-                    wet = (m == 9 || m == 10 || m == 18 || m == 19) ? 1.0f : 0.52f;
+                    wet = (m == 9 || m == 10 || m == 18 || m == 19) ? 1.0f : 0.54f;
                     break;
             }
         }
@@ -184,8 +218,10 @@ public:
                 if (m == 19) {
                     lfo = static_cast<float>(2.0 / std::numbers::pi * std::asin(std::sin(lfoPhase)));
                 } else if (m == 17) {
-                    lfo = std::tanh(lfo * 1.8f + 0.25f);
+                    // Demeter TRM-1 Opto-coupler asymmetric lag curve
+                    lfo = std::tanh(lfo * 1.85f + 0.28f);
                 } else if (m == 20) {
+                    // Tube bias-vary tremolo harmonic asymmetry
                     lfo = lfo * (0.9f - 0.35f * biasAmt) + (0.1f + 0.45f * biasAmt) * std::sin(2.0f * static_cast<float>(lfoPhase));
                 }
                 lfoPhase += phaseInc;
@@ -198,14 +234,38 @@ public:
             return;
         }
 
-        // 2. Phaser & Uni-Vibe Family (11..16)
+        // 2. White-Box 4-Stage Cascaded All-Pass Phaser & Shin-Ei Uni-Vibe Family (11..16)
         if (m >= 11 && m <= 16) {
-            const bool isVibe = (m >= 15);
-            const bool isPan  = (m == 14);
-            const bool vibratoOnly = (m == 16 && p.useSlotParams && modeChoice == 1);
+            const bool isPhase90    = (m == 11);
+            const bool isSmallStone = (m == 13);
+            const bool isPan        = (m == 14);
+            const bool isVibe       = (m == 15 || m == 16);
+            const bool vibratoOnly  = (m == 16 && p.useSlotParams && modeChoice == 1);
+
+            // Real Shin-Ei Uni-Vibe staggered capacitor ratios (1.0 : 2.35 : 5.8 : 14.2) create its signature throb!
+            static constexpr double kVibeStageMult[4] = { 1.0, 2.35, 5.80, 14.20 };
+            const float feedbackGain = isSmallStone ? (modeChoice == 1 ? 0.74f : 0.16f)
+                                                    : (isPhase90 ? 0.36f : (isVibe ? 0.28f : 0.42f));
+            const float lampAtk = std::exp(-1.0f / static_cast<float>(0.018 * sampleRate)); // Fast bulb heat-up
+            const float lampRel = std::exp(-1.0f / static_cast<float>(0.055 * sampleRate)); // Slower CdS photocell decay
+
+            std::array<float, 4> aCoeff { 0.0f, 0.0f, 0.0f, 0.0f };
+            const double invSrPi = std::numbers::pi / sampleRate;
+
             for (int i = 0; i < numSamples; ++i) {
-                float lfo = static_cast<float>(std::sin(lfoPhase));
-                if (isVibe) lfo = std::tanh(lfo * 1.6f - 0.35f);
+                // Authentic waveform per circuit: triangle for Phase 90 / Small Stone, lamp-lagged asymmetric sine for Uni-Vibe
+                double tri = 2.0 / std::numbers::pi * std::asin(std::sin(lfoPhase));
+                double norm = 0.5 + 0.5 * tri * static_cast<double>(depth);
+
+                if (isVibe) {
+                    const float rawBulb = 0.5f + 0.5f * static_cast<float>(std::sin(lfoPhase));
+                    const float shapedBulb = std::pow(std::clamp(rawBulb, 0.0f, 1.0f), 1.65f);
+                    const float c = (shapedBulb > vibeLampEnv) ? lampAtk : lampRel;
+                    vibeLampEnv = c * vibeLampEnv + (1.0f - c) * shapedBulb;
+                    norm = 0.5 + (static_cast<double>(vibeLampEnv) - 0.5) * static_cast<double>(depth) * 1.15;
+                    norm = std::clamp(norm, 0.02, 0.98);
+                }
+
                 lfoPhase += phaseInc;
                 if (lfoPhase >= 2.0 * std::numbers::pi) lfoPhase -= 2.0 * std::numbers::pi;
 
@@ -216,26 +276,65 @@ public:
                     if (lfoPhase2 >= 2.0 * std::numbers::pi) lfoPhase2 -= 2.0 * std::numbers::pi;
                 }
 
-                if ((i & 7) == 0) {
-                    const double norm = 0.5 + 0.5 * static_cast<double>(lfo) * static_cast<double>(depth);
-                    const double f1 = 260.0 * std::pow(5.5, norm);
-                    const double f2 = f1 * (isVibe ? 2.15 : 2.65);
-                    const double gainDb = (m == 13) ? (modeChoice == 1 ? -16.5 : -11.0) : -10.5;
-                    const double qPhs = (m == 13 && modeChoice == 1) ? 2.4 : (isVibe ? 1.1 : 1.6);
-                    phaserPeak1.setPeaking(sampleRate, f1, qPhs, gainDb);
-                    phaserPeak2.setPeaking(sampleRate, f2, qPhs, -gainDb * 0.85);
+                // Update 4-stage 1st-order all-pass coefficients (a = (tan(pi*fc/fs) - 1) / (tan(pi*fc/fs) + 1))
+                if ((i & 3) == 0) {
+                    if (isVibe) {
+                        const double baseFc = 115.0 * std::pow(7.2, norm);
+                        for (int s = 0; s < 4; ++s) {
+                            const double fc = std::clamp(baseFc * kVibeStageMult[s], 45.0, sampleRate * 0.42);
+                            const double t = std::tan(fc * invSrPi);
+                            aCoeff[static_cast<size_t>(s)] = static_cast<float>((t - 1.0) / (t + 1.0));
+                        }
+                    } else {
+                        const double minFc = isSmallStone ? 105.0 : (isPhase90 ? 190.0 : 160.0);
+                        const double ratio = isSmallStone ? 28.0  : (isPhase90 ? 12.5  : 16.0);
+                        const double fc = std::clamp(minFc * std::pow(ratio, norm), 55.0, sampleRate * 0.42);
+                        const double t = std::tan(fc * invSrPi);
+                        const float a = static_cast<float>((t - 1.0) / (t + 1.0));
+                        aCoeff = { a, a, a, a };
+                    }
                 }
 
                 const float inL = chL[i];
                 const float inR = (chR != nullptr) ? chR[i] : inL;
-                const float pL = phaserPeak2.processSample(0, phaserPeak1.processSample(0, inL));
-                const float pR = phaserPeak2.processSample(1, phaserPeak1.processSample(1, inR));
+
+                // Soft JFET/OTA saturation inside feedback sum for genuine analog chewy warmth
+                float xL = std::tanh((inL + apFbL * feedbackGain) * 1.05f);
+                float xR = std::tanh((inR + apFbR * feedbackGain) * 1.05f);
+
+                for (int s = 0; s < 4; ++s) {
+                    const size_t si = static_cast<size_t>(s);
+                    const float a = aCoeff[si];
+
+                    const float yL = a * xL + apPrevInL[si] - a * apStateL[si];
+                    apPrevInL[si] = xL;
+                    apStateL[si]  = yL;
+                    xL = yL;
+
+                    const float yR = a * xR + apPrevInR[si] - a * apStateR[si];
+                    apPrevInR[si] = xR;
+                    apStateR[si]  = yR;
+                    xR = yR;
+                }
+
+                apFbL = xL;
+                apFbR = xR;
 
                 const float panL = isPan ? (1.0f - 0.45f * depth2 * panLfo) : 1.0f;
                 const float panR = isPan ? (1.0f + 0.45f * depth2 * panLfo) : 1.0f;
-                const float dryMix = vibratoOnly ? 0.0f : (1.0f - wet * 0.5f);
-                chL[i] = (inL * dryMix + pL * wet * 0.90f) * panL * outVol;
-                if (chR != nullptr) chR[i] = (inR * dryMix + pR * wet * 0.90f) * panR * outVol;
+
+                if (vibratoOnly) {
+                    // Uni-Vibe Vibrato Mode: 100% phase-modulated wet path (classic watery pitch warble)
+                    chL[i] = xL * panL * outVol;
+                    if (chR != nullptr) chR[i] = xR * panR * outVol;
+                } else {
+                    // Authentic 50/50 phase-cancellation summing (Vibe uses wet inversion for deep low-mid pulse)
+                    const float sign = isVibe ? -1.0f : 1.0f;
+                    const float wetAmt = std::clamp(wet, 0.15f, 1.0f) * 0.62f;
+                    const float dryAmt = 1.0f - wetAmt * 0.48f;
+                    chL[i] = (inL * dryAmt + sign * xL * wetAmt) * panL * outVol;
+                    if (chR != nullptr) chR[i] = (inR * dryAmt + sign * xR * wetAmt) * panR * outVol;
+                }
             }
             return;
         }
@@ -276,8 +375,8 @@ public:
                     swellGain = relC * swellGain;
                 }
                 float shapedG = swellGain;
-                if (modeChoice == 1)      shapedG = swellGain * swellGain;       // Exp
-                else if (modeChoice == 2) shapedG = std::sqrt(std::max(0.0f, swellGain)); // Log
+                if (modeChoice == 1)      shapedG = swellGain * swellGain;
+                else if (modeChoice == 2) shapedG = std::sqrt(std::max(0.0f, swellGain));
                 const float g = (1.0f - wet) + wet * shapedG;
                 chL[i] *= g;
                 if (chR != nullptr) chR[i] *= g;
@@ -286,6 +385,8 @@ public:
         }
 
         // 5. Chorus (0..3), Flanger (4..7), Vibrato (8..10), Detune (21)
+        const bool isCe1      = (m == 0 || m == 9);  // Boss CE-1 Chorus / Vibrato (MN3002 BBD!)
+        const bool isDimC     = (m == 1);            // Boss Dimension C (Dual-BBD Opposing Triangle LFO!)
         const bool isFlanger  = (m >= 4 && m <= 7);
         const bool isVibrato  = (m >= 8 && m <= 10);
         const bool isDetune   = (m == 21);
@@ -295,16 +396,26 @@ public:
 
         const float centerMs = isFlanger ? std::clamp(preDelayMs * (p.useSlotParams ? 0.55f : 0.22f), 0.5f, 9.0f)
                                          : (isVibrato ? 4.5f : std::clamp(preDelayMs, 3.0f, 25.0f));
-        const float modMsL = isDetune ? (0.3f + depth * 1.4f) : (isFlanger ? depth * 2.8f : (isVibrato ? depth * 2.2f : depth * 4.5f));
+        const float modMsL = isDetune ? (0.3f + depth * 1.4f)
+                                      : (isDimC ? (1.2f + depth * 3.1f)
+                                                : (isFlanger ? depth * 2.8f : (isVibrato ? depth * 2.2f : depth * 4.5f)));
         const float modMsC = isMChorus ? (sp[4] * 0.01f * 4.2f) : 0.0f;
         const float modMsR = isMChorus ? (sp[5] * 0.01f * 4.5f) : modMsL;
         const float fb = isFlanger ? ((m == 6) ? -std::clamp(fbAmt, 0.0f, 0.85f) : std::clamp(fbAmt, 0.0f, 0.85f)) : 0.0f;
         const float msToSamples = static_cast<float>(sampleRate * 0.001);
 
         for (int i = 0; i < numSamples; ++i) {
-            const float sinL = static_cast<float>(std::sin(lfoPhase));
-            const float sinC = static_cast<float>(std::sin(lfoPhase + 2.0943951));
-            const float sinR = static_cast<float>(std::sin(lfoPhase + 1.5707963268));
+            float lfoL = static_cast<float>(std::sin(lfoPhase));
+            float lfoC = static_cast<float>(std::sin(lfoPhase + 2.0943951));
+            float lfoR = static_cast<float>(std::sin(lfoPhase + 1.5707963268));
+
+            if (isDimC) {
+                // Boss Dimension C: pure opposing triangle LFOs (180° out of phase -> lush spatial motion with ZERO pitch wobble!)
+                const float tri = static_cast<float>(2.0 / std::numbers::pi * std::asin(std::sin(lfoPhase)));
+                lfoL =  tri;
+                lfoR = -tri;
+            }
+
             lfoPhase += phaseInc;
             if (lfoPhase >= 2.0 * std::numbers::pi) lfoPhase -= 2.0 * std::numbers::pi;
 
@@ -319,20 +430,36 @@ public:
             const float inL = chL[i];
             const float inR = (chR != nullptr) ? chR[i] : inL;
 
-            const float srcL = isBassMod ? bassHpf.processSample(0, inL) : inL;
-            const float srcR = isBassMod ? bassHpf.processSample(1, inR) : inR;
+            float srcL = isBassMod ? bassHpf.processSample(0, inL) : inL;
+            float srcR = isBassMod ? bassHpf.processSample(1, inR) : inR;
+
+            if (isCe1 || isDimC) {
+                // Authentic analog BBD pre-emphasis + warm preamp saturation before delay line
+                srcL = std::tanh(bbdPreEmph.processSample(0, srcL) * (isCe1 ? 1.18f : 1.06f));
+                srcR = std::tanh(bbdPreEmph.processSample(1, srcR) * (isCe1 ? 1.18f : 1.06f));
+            }
 
             delayL.pushSample(0, srcL + fbL * fb);
             delayR.pushSample(0, srcR + fbR * fb);
             if (isMChorus) delayC.pushSample(0, 0.5f * (srcL + srcR));
 
-            const float dSamplesL = std::clamp((centerMs + sinL * modMsL) * msToSamples, 2.0f, static_cast<float>(maxDelaySamples - 4));
-            const float dSamplesR = std::clamp((centerMs + sinR * modMsR) * msToSamples, 2.0f, static_cast<float>(maxDelaySamples - 4));
+            const float dSamplesL = std::clamp((centerMs + lfoL * modMsL) * msToSamples, 2.0f, static_cast<float>(maxDelaySamples - 4));
+            const float dSamplesR = std::clamp((centerMs + lfoR * modMsR) * msToSamples, 2.0f, static_cast<float>(maxDelaySamples - 4));
 
-            float wetL = wetTone.processSample(0, delayL.popSample(0, dSamplesL));
-            float wetR = wetTone.processSample(1, delayR.popSample(0, dSamplesR));
+            float wetL = delayL.popSample(0, dSamplesL);
+            float wetR = delayR.popSample(0, dSamplesR);
+
+            if (isCe1 || isDimC) {
+                // Complementary BBD de-emphasis + MN3002/MN3007 clock anti-aliasing filter
+                wetL = bbdAntiAlias.processSample(0, bbdDeEmph.processSample(0, wetL));
+                wetR = bbdAntiAlias.processSample(1, bbdDeEmph.processSample(1, wetR));
+            } else {
+                wetL = wetTone.processSample(0, wetL);
+                wetR = wetTone.processSample(1, wetR);
+            }
+
             if (isMChorus) {
-                const float dSamplesC = std::clamp((centerMs + 2.5f + sinC * modMsC) * msToSamples, 2.0f, static_cast<float>(maxDelaySamples - 4));
+                const float dSamplesC = std::clamp((centerMs + 2.5f + lfoC * modMsC) * msToSamples, 2.0f, static_cast<float>(maxDelaySamples - 4));
                 const float wetC = delayC.popSample(0, dSamplesC) * 0.45f;
                 wetL = wetL * 0.72f + wetC;
                 wetR = wetR * 0.72f + wetC;
@@ -340,12 +467,26 @@ public:
             fbL = std::tanh(wetL);
             fbR = std::tanh(wetR);
 
-            const float dryMix = isVibrato ? 0.0f : (isDetune ? dry : (1.0f - wet * 0.45f));
-            const float wetMix = isVibrato ? 1.0f : wet;
-
-            chL[i] = (inL * dryMix + wetL * wetMix) * trmGain * outVol;
-            if (chR != nullptr) {
-                chR[i] = (inR * dryMix + wetR * wetMix) * trmGain * outVol;
+            if (isDimC) {
+                // Boss Dimension C cross-coupled stereo matrix: adds wide 3D halo while cancelling mono pitch warble!
+                const float dimL = wetL - 0.34f * wetR;
+                const float dimR = wetR - 0.34f * wetL;
+                const float dryMix = 1.0f - wet * 0.25f;
+                chL[i] = (inL * dryMix + dimL * wet * 0.78f) * outVol;
+                if (chR != nullptr) chR[i] = (inR * dryMix + dimR * wet * 0.78f) * outVol;
+            } else if (m == 0) {
+                // Boss CE-1 Chorus: legendary wide stereo spread (L = dry + wet, R = dry - wet) + warm CE-1 buffer
+                const float monoWet = 0.5f * (wetL + wetR);
+                const float dryMix = 1.0f - wet * 0.32f;
+                chL[i] = (inL * dryMix + monoWet * wet) * outVol;
+                if (chR != nullptr) chR[i] = (inR * dryMix - monoWet * wet) * outVol;
+            } else {
+                const float dryMix = isVibrato ? 0.0f : (isDetune ? dry : (1.0f - wet * 0.45f));
+                const float wetMix = isVibrato ? 1.0f : wet;
+                chL[i] = (inL * dryMix + wetL * wetMix) * trmGain * outVol;
+                if (chR != nullptr) {
+                    chR[i] = (inR * dryMix + wetR * wetMix) * trmGain * outVol;
+                }
             }
         }
     }
@@ -356,6 +497,12 @@ private:
     double lfoPhase = 0.0;
     double lfoPhase2 = 0.0;
     float fbL = 0.0f, fbR = 0.0f;
+    float apFbL = 0.0f, apFbR = 0.0f;
+    float vibeLampEnv = 0.5f;
+    std::array<float, 4> apStateL {};
+    std::array<float, 4> apStateR {};
+    std::array<float, 4> apPrevInL {};
+    std::array<float, 4> apPrevInR {};
     float swellGain = 0.0f;
     float crushHoldL = 0.0f, crushHoldR = 0.0f;
     int crushCounter = 0;
@@ -364,11 +511,12 @@ private:
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Lagrange3rd> delayR { 4096 };
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Lagrange3rd> delayC { 4096 };
     BiquadFilter wetTone;
+    BiquadFilter bbdPreEmph;
+    BiquadFilter bbdDeEmph;
+    BiquadFilter bbdAntiAlias;
     BiquadFilter bassHpf;
     BiquadFilter crushLpf;
     BiquadFilter crushHpf;
-    BiquadFilter phaserPeak1;
-    BiquadFilter phaserPeak2;
 };
 
 } // namespace pedalboard

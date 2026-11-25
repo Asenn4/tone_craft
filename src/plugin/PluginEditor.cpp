@@ -57,12 +57,22 @@ PedalBoardAudioProcessorEditor::PedalBoardAudioProcessorEditor(PedalBoardAudioPr
         [this](int rigIdx) { processor.clearNamModel(rigIdx); }
     );
     ampView->setBrowseCloudNamCallback([this](int rigIdx) { openTone3000Browser(CloudLoadTargetKind::AmpRig, rigIdx); });
+    ampView->setFindPackOnCloudCallback([this](int rigIdx, const juce::String& query) {
+        openTone3000Browser(CloudLoadTargetKind::AmpRig, rigIdx, query);
+    });
     cabView = std::make_unique<CabRoomView>(
         processor,
         [this](int rigIdx) { handleLoadCabinetIR(rigIdx); },
         [this](int rigIdx) { processor.resetCabinetIR(rigIdx); }
     );
     cabView->setBrowseCloudIrCallback([this](int rigIdx) { openTone3000Browser(CloudLoadTargetKind::CabRig, rigIdx); });
+    cabView->setFindPackOnCloudCallback([this](int rigIdx, const juce::String& query, const juce::String& extUrl) {
+        if (extUrl.isNotEmpty()) {
+            juce::URL(extUrl).launchInDefaultBrowser();
+        } else {
+            openTone3000Browser(CloudLoadTargetKind::CabRig, rigIdx, query);
+        }
+    });
     rackView = std::make_unique<RackAndMixerView>(processor);
 
     addChildComponent(*stompView);
@@ -333,6 +343,7 @@ bool PedalBoardAudioProcessorEditor::keyPressed(const juce::KeyPress& key) {
     if (ch == 'g') { toggleGearSidebar(); return true; }
     if (ch == 'p') { togglePresetBrowser(); return true; }
     if (ch == 't') { openTone3000Browser(CloudLoadTargetKind::Auto, 0); return true; }
+    if (ch == 'b') { processor.triggerTapTempo(); if (stageNavBar != nullptr) stageNavBar->repaint(); return true; }
     if (ch == ',') { openStudioSettings(StudioSettingsContent::Tab::AudioIo); return true; }
     if (ch == 'm' && topBar != nullptr) { topBar->toggleTunerMute(); return true; }
     if (ch == 's' && looperBar != nullptr) { looperBar->triggerLooperStopToggle(); return true; }
@@ -497,7 +508,7 @@ void PedalBoardAudioProcessorEditor::togglePresetBrowser() {
     browserOverlay->setVisible(show);
 }
 
-void PedalBoardAudioProcessorEditor::openTone3000Browser(CloudLoadTargetKind kind, int rigOrSlotIndex) {
+void PedalBoardAudioProcessorEditor::openTone3000Browser(CloudLoadTargetKind kind, int rigOrSlotIndex, const juce::String& searchQuery) {
     if (tone3000Client == nullptr) return;
 
     if (cloudWindow == nullptr) {
@@ -510,13 +521,13 @@ void PedalBoardAudioProcessorEditor::openTone3000Browser(CloudLoadTargetKind kin
         );
     }
 
-    // Toggle off if triggered via NavBar/T while already visible in Auto mode
-    if (kind == CloudLoadTargetKind::Auto && cloudWindow->isVisible()) {
+    // Toggle off if triggered via NavBar/T while already visible in Auto mode with no search query
+    if (kind == CloudLoadTargetKind::Auto && searchQuery.isEmpty() && cloudWindow->isVisible()) {
         cloudWindow->setVisible(false);
         return;
     }
 
-    cloudWindow->showForTarget(this, kind, rigOrSlotIndex);
+    cloudWindow->showForTarget(this, kind, rigOrSlotIndex, searchQuery);
 }
 
 void PedalBoardAudioProcessorEditor::handleCloudCaptureLoaded(const CloudLoadRequest& req) {
@@ -594,12 +605,7 @@ void PedalBoardAudioProcessorEditor::timerCallback() {
     if (cabView->isVisible())   cabView->updateLive();
     if (rackView->isVisible())  rackView->updateLive();
 
-    processor.getSignalChain().getAmpHead(0).getNamRunner().reclaimRetired();
-    processor.getSignalChain().getAmpHead(1).getNamRunner().reclaimRetired();
-    processor.getSignalChain().getAmpHead(2).getNamRunner().reclaimRetired();
-    for (int s = 0; s < kMaxPedalSlots; ++s) {
-        processor.getSignalChain().getSlotNamRunner(s).reclaimRetired();
-    }
+    processor.getSignalChain().reclaimAllRetiredNamModels();
 
     const auto curMode = processor.getRoutingMode();
     if (curMode != lastObservedRoutingMode) {

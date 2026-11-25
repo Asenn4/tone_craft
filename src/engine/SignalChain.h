@@ -54,6 +54,7 @@ struct ChainParams {
     bool inputPhaseInvert = false;
     float inputRumbleHpfHz = 0.0f; // 0 = OFF, or 40 / 60 / 80 Hz
     bool outputSafetyLimiter = true;
+    float tempoBpm = 120.0f;
 
     float looperLevelDb = 0.0f;
     bool looperPreFx = false;
@@ -688,6 +689,27 @@ public:
         return customSlotDsps[static_cast<size_t>(std::clamp(slotId, 0, kMaxPedalSlots - 1))].getNamRunner();
     }
 
+    bool isSlotUsingPackCapture(int slotId) const noexcept {
+        if (slotId < 0 || slotId >= kMaxPedalSlots) return false;
+        return customSlotDsps[static_cast<size_t>(slotId)].isUsingPackCapture();
+    }
+
+    juce::String getSlotPackCaptureName(int slotId) const {
+        if (slotId < 0 || slotId >= kMaxPedalSlots) return {};
+        return customSlotDsps[static_cast<size_t>(slotId)].getPackCaptureName();
+    }
+
+    void setSlotPreampColorEnabled(int slotId, bool enabled) {
+        if (slotId >= 0 && slotId < kMaxPedalSlots) {
+            customSlotDsps[static_cast<size_t>(slotId)].setPreampColorEnabled(enabled);
+        }
+    }
+
+    bool isSlotPreampColorEnabled(int slotId) const noexcept {
+        if (slotId < 0 || slotId >= kMaxPedalSlots) return false;
+        return customSlotDsps[static_cast<size_t>(slotId)].isPreampColorEnabled();
+    }
+
     AmpHead& getAmpHead(int rigIndex = 0) noexcept { return rigIndex == 2 ? ampHeadC : (rigIndex == 1 ? ampHeadB : ampHeadA); }
     const AmpHead& getAmpHead(int rigIndex = 0) const noexcept { return rigIndex == 2 ? ampHeadC : (rigIndex == 1 ? ampHeadB : ampHeadA); }
 
@@ -709,18 +731,49 @@ public:
         ampHeadA.getNamRunner().setLoudnessNormalizationEnabled(enabled);
         ampHeadB.getNamRunner().setLoudnessNormalizationEnabled(enabled);
         ampHeadC.getNamRunner().setLoudnessNormalizationEnabled(enabled);
+        ampHeadA.getPackNamRunner().setLoudnessNormalizationEnabled(enabled);
+        ampHeadB.getPackNamRunner().setLoudnessNormalizationEnabled(enabled);
+        ampHeadC.getPackNamRunner().setLoudnessNormalizationEnabled(enabled);
         for (auto& s : customSlotDsps) {
             s.getNamRunner().setLoudnessNormalizationEnabled(enabled);
+            s.getPackNamRunner().setLoudnessNormalizationEnabled(enabled);
+        }
+    }
+
+    void reclaimAllRetiredNamModels() {
+        ampHeadA.getNamRunner().reclaimRetired();
+        ampHeadB.getNamRunner().reclaimRetired();
+        ampHeadC.getNamRunner().reclaimRetired();
+        ampHeadA.getPackNamRunner().reclaimRetired();
+        ampHeadB.getPackNamRunner().reclaimRetired();
+        ampHeadC.getPackNamRunner().reclaimRetired();
+        for (auto& s : customSlotDsps) {
+            s.getNamRunner().reclaimRetired();
+            s.getPackNamRunner().reclaimRetired();
+        }
+    }
+
+    void refreshAllModelPacks() {
+        ModelPackRegistry::instance().rescan();
+        ampHeadA.requestPackRefresh();
+        ampHeadB.requestPackRefresh();
+        ampHeadC.requestPackRefresh();
+        cabinetIrA.requestPackRefresh();
+        cabinetIrB.requestPackRefresh();
+        cabinetIrC.requestPackRefresh();
+        reverb.requestPackRefresh();
+        for (auto& s : customSlotDsps) {
+            s.requestPackRefresh();
         }
     }
 
     int getActiveNamModelCount() const noexcept {
         int count = 0;
-        if (ampHeadA.getNamRunner().hasLoadedModel()) ++count;
-        if (ampHeadB.getNamRunner().hasLoadedModel()) ++count;
-        if (ampHeadC.getNamRunner().hasLoadedModel()) ++count;
+        if (ampHeadA.getNamRunner().hasLoadedModel() || ampHeadA.isUsingPackNam()) ++count;
+        if (ampHeadB.getNamRunner().hasLoadedModel() || ampHeadB.isUsingPackNam()) ++count;
+        if (ampHeadC.getNamRunner().hasLoadedModel() || ampHeadC.isUsingPackNam()) ++count;
         for (const auto& s : customSlotDsps) {
-            if (s.getNamRunner().hasLoadedModel()) ++count;
+            if (s.getNamRunner().hasLoadedModel() || s.getPackNamRunner().hasLoadedModel()) ++count;
         }
         return count;
     }
@@ -730,7 +783,7 @@ private:
         switch (node.kind) {
             case ChainNodeKind::PedalSlot:
                 if (node.slotId >= 0 && node.slotId < kMaxPedalSlots) {
-                    customSlotDsps[static_cast<size_t>(node.slotId)].process(buf, p.pedalSlots[static_cast<size_t>(node.slotId)]);
+                    customSlotDsps[static_cast<size_t>(node.slotId)].process(buf, p.pedalSlots[static_cast<size_t>(node.slotId)], p.tempoBpm);
                 }
                 break;
             case ChainNodeKind::AmpHead:
@@ -742,10 +795,10 @@ private:
                 else         cabinetIrA.process(buf, p.cabA);
                 break;
             case ChainNodeKind::RackMod:
-                stereoChorus.process(buf, p.rackSlots[0].occupied ? buildChorusParamsFromSlot(p.rackSlots[0]) : p.chorus);
+                stereoChorus.process(buf, p.rackSlots[0].occupied ? buildChorusParamsFromSlot(p.rackSlots[0], p.tempoBpm) : p.chorus);
                 break;
             case ChainNodeKind::RackDelay:
-                stereoDelay.process(buf, p.rackSlots[1].occupied ? buildDelayParamsFromSlot(p.rackSlots[1]) : p.delay);
+                stereoDelay.process(buf, p.rackSlots[1].occupied ? buildDelayParamsFromSlot(p.rackSlots[1], p.tempoBpm) : p.delay);
                 break;
             case ChainNodeKind::RackReverb:
                 reverb.process(buf, p.rackSlots[2].occupied ? buildReverbParamsFromSlot(p.rackSlots[2]) : p.reverb);

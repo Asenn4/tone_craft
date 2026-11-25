@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../engine/Gp200Catalogue.h"
+#include "../engine/ModelPackRegistry.h"
 #include "../plugin/Parameters.h"
 #include "../plugin/PluginProcessor.h"
 #include "MidiBindableControl.h"
@@ -178,6 +179,20 @@ public:
         };
         addAndMakeVisible(resetIrBtn);
 
+        findPackIrBtn.setButtonText("FIND IR");
+        findPackIrBtn.setColour(juce::TextButton::buttonColourId, juce::Colour(0xff0f766e));
+        findPackIrBtn.onClick = [this] {
+            const int m = getCurrentModelIndex();
+            const auto& e = gp200::getModelEntry(ModuleId::CabinetIR, m);
+            const auto info = ModelPackRegistry::getExcelPackInfo(e.excelNo);
+            const juce::String q = (info.searchQuery != nullptr && info.searchQuery[0] != '\0')
+                ? juce::String::fromUTF8(info.searchQuery)
+                : juce::String::fromUTF8(e.description);
+            const juce::String ext = (info.externalFreeUrl != nullptr) ? juce::String::fromUTF8(info.externalFreeUrl) : juce::String();
+            if (findPackIrCb) findPackIrCb(activeRig, q, ext);
+        };
+        addAndMakeVisible(findPackIrBtn);
+
         addAndMakeVisible(filterCurve);
 
         const char* names[3] = { "LOW CUT", "HI CUT", "VOLUME" };
@@ -212,6 +227,10 @@ public:
 
     void setBrowseCloudIrCallback(std::function<void(int)> cb) {
         browseCloudIrCb = std::move(cb);
+    }
+
+    void setFindPackOnCloudCallback(std::function<void(int, const juce::String&, const juce::String&)> cb) {
+        findPackIrCb = std::move(cb);
     }
 
     void updateLive() {
@@ -291,6 +310,24 @@ public:
         cloudIrBtn.setColour(juce::TextButton::textColourOffId,
                              active ? juce::Colour(0xffe2e8f0) : juce::Colour(0xff64748b));
         cloudIrBtn.repaint();
+
+        if (!isUserIr) {
+            const auto& curEntry = gp200::getModelEntry(ModuleId::CabinetIR, m);
+            const auto packHint = ModelPackRegistry::getExpectedFilenameHint(ModuleId::CabinetIR, m);
+            const auto packInfo = ModelPackRegistry::getExcelPackInfo(curEntry.excelNo);
+            const bool isExt = (packInfo.externalFreeUrl != nullptr && packInfo.externalFreeUrl[0] != '\0');
+            findPackIrBtn.setTooltip(
+                (isExt ? ("Open free IR source (" + juce::String::fromUTF8(packInfo.externalFreeUrl) + ")")
+                       : ("Find real .wav IR on TONE3000 (\"" + juce::String::fromUTF8(packInfo.searchQuery) + "\")"))
+                + ". Save as " + packHint + " in ModelPacks to auto-bind!"
+            );
+        }
+        findPackIrBtn.getProperties().set("bypassed", bypassed);
+        findPackIrBtn.setColour(juce::TextButton::buttonColourId,
+                                active ? juce::Colour(0xff0f766e) : juce::Colour(0xff232934));
+        findPackIrBtn.setColour(juce::TextButton::textColourOffId,
+                                active ? juce::Colour(0xffe2e8f0) : juce::Colour(0xff64748b));
+        findPackIrBtn.repaint();
 
         const bool hasIr = processor.getSignalChain().getCabinet(activeRig).hasCustomIrFile();
         resetIrBtn.setEnabled(hasIr);
@@ -419,14 +456,20 @@ public:
         g.drawRoundedRectangle(irLcd, 5.0f, 1.0f);
 
         if (!isUserIr) {
-            g.setColour(active ? juce::Colour(0xff60a5fa) : juce::Colour(0xff64748b));
+            const bool hasPackIr = cabRef.isUsingPackIr();
+            g.setColour(active ? (hasPackIr ? juce::Colour(0xff22d3ee) : juce::Colour(0xff60a5fa)) : juce::Colour(0xff64748b));
             g.setFont(juce::Font(juce::FontOptions(8.4f, juce::Font::bold)));
-            g.drawText(juce::String("FACTORY CABINET  |  ") + juce::String::fromUTF8(entry.subType),
+            g.drawText(hasPackIr
+                           ? (juce::String("REAL CAB IR PACK ACTIVE  |  ") + juce::String::fromUTF8(entry.subType))
+                           : (juce::String("FACTORY CABINET  |  ") + juce::String::fromUTF8(entry.subType)),
                        irLcd.reduced(8.0f, 3.0f).withHeight(13.0f), juce::Justification::centredLeft, true);
 
             g.setColour(active ? juce::Colours::white : juce::Colour(0xff64748b));
             g.setFont(juce::Font(juce::FontOptions(irLcd.getHeight() < 40.0f ? 10.5f : 11.8f, juce::Font::bold)));
-            g.drawText(juce::String::fromUTF8(entry.name) + "   —   " + juce::String::fromUTF8(entry.description),
+            const juce::String cabTitle = hasPackIr
+                ? (juce::String::fromUTF8(entry.name) + "   —   " + cabRef.getPackIrName())
+                : (juce::String::fromUTF8(entry.name) + "   —   " + juce::String::fromUTF8(entry.description));
+            g.drawText(cabTitle,
                        irLcd.reduced(8.0f, 3.0f).withTop(irLcd.getY() + 16.0f), juce::Justification::centredLeft, true);
         } else {
             g.setColour((active && hasCustomIr) ? juce::Colour(0xff38bdf8) : juce::Colour(0xff64748b));
@@ -514,15 +557,21 @@ public:
             modeUserIrBtn.setBounds(row1b);
         }
 
-        // Mode-specific section: FACTORY CAB shows clean Model Dropdown + Spec Card; USER IR shows OLED Card + Load/Cloud/Clear buttons!
+        // Mode-specific section: FACTORY CAB shows clean Model Dropdown + Find IR + Spec Card; USER IR shows OLED Card + Load/Cloud/Clear buttons!
         cabModelBox.setVisible(!isUserIr);
+        findPackIrBtn.setVisible(!isUserIr);
         loadIrBtn.setVisible(isUserIr);
         cloudIrBtn.setVisible(isUserIr);
         resetIrBtn.setVisible(isUserIr);
 
         inner.removeFromTop(vGap);
         if (!isUserIr) {
-            cabModelBox.setBounds(inner.removeFromTop(rowH));
+            auto modelRow = inner.removeFromTop(rowH);
+            const int findW = (modelRow.getWidth() < 320) ? 58 : 74;
+            findPackIrBtn.setButtonText(findW < 68 ? "IR" : "FIND IR");
+            findPackIrBtn.setBounds(modelRow.removeFromRight(findW));
+            modelRow.removeFromRight(5);
+            cabModelBox.setBounds(modelRow);
             inner.removeFromTop(compactH ? 5 : 7);
             irDisplayRect = inner.removeFromTop(compactH ? 38 : 44);
         } else {
@@ -653,6 +702,7 @@ private:
     std::function<void(int)> loadIrCb;
     std::function<void(int)> resetIrCb;
     std::function<void(int)> browseCloudIrCb;
+    std::function<void(int, const juce::String&, const juce::String&)> findPackIrCb;
     int activeRig = 0;
     RoutingMode lastRoutingMode = RoutingMode::Serial;
     std::array<int, 3> lastFactoryCab { 7, 7, 7 };
@@ -668,7 +718,7 @@ private:
     juce::ComboBox cabModelBox;
     MidiBindableButton bypassBtn;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAtt;
-    juce::TextButton loadIrBtn, cloudIrBtn, resetIrBtn;
+    juce::TextButton loadIrBtn, cloudIrBtn, resetIrBtn, findPackIrBtn;
     CabFilterCurveDisplay filterCurve;
 
     std::array<MidiBindableSlider, 3> knobs;

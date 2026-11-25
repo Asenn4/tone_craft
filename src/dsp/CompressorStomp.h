@@ -1,6 +1,7 @@
 #pragma once
 
 #include "BiquadFilter.h"
+#include "TempoSync.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -27,6 +28,7 @@ public:
         // Authentic per-model slot parameter vector (from Gp200ParamSpecs.h)
         bool useSlotParams = false;
         std::array<float, 12> slotParams {};
+        float tempoBpm = 120.0f;
     };
 
     void prepare(const juce::dsp::ProcessSpec& spec) noexcept {
@@ -192,14 +194,18 @@ public:
                     wetMix = std::clamp(sp[3] * 0.01f, 0.0f, 1.0f);
                 } else if (m == 13) { // A-WAH: Depth, Rate, Volume, Low, Q, High, Sync
                     depthNorm = std::clamp(static_cast<double>(sp[0]) * 0.01, 0.0, 1.0);
-                    rateHz    = std::clamp(static_cast<double>(sp[1]), 0.15, 10.0);
+                    rateHz    = (sp[6] > 0.5f)
+                                    ? static_cast<double>(tempo_sync::syncedModRateHz(sp[1], 0.2f, 8.0f, p.tempoBpm))
+                                    : std::clamp(static_cast<double>(sp[1]), 0.15, 10.0);
                     outGain   = juce::Decibels::decibelsToGain(-12.0f + sp[2] * 1.8f);
                     lowHz     = std::clamp(static_cast<double>(sp[3]), 80.0, 1200.0);
                     qVal      = std::clamp(static_cast<double>(sp[4]), 1.5, 10.0);
                     highHz    = std::max(lowHz + 150.0, std::clamp(static_cast<double>(sp[5]), 600.0, 5000.0));
                 } else { // Step Filter: Step 1-4, Rate, Sync
                     for (int k = 0; k < 4; ++k) stepVals[k] = std::clamp(static_cast<double>(sp[static_cast<size_t>(k)]) * 0.1, 0.0, 1.0);
-                    rateHz = std::clamp(static_cast<double>(sp[4]), 0.3, 14.0);
+                    rateHz = (sp[5] > 0.5f)
+                                 ? static_cast<double>(tempo_sync::syncedModRateHz(sp[4], 0.5f, 12.0f, p.tempoBpm)) * 0.25
+                                 : std::clamp(static_cast<double>(sp[4]), 0.3, 14.0);
                     qVal   = 5.5;
                     lowHz  = 240.0; highHz = 2800.0;
                 }

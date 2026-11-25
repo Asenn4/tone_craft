@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../engine/Gp200Catalogue.h"
+#include "../engine/ModelPackRegistry.h"
 #include "BiquadFilter.h"
 #include <algorithm>
 #include <atomic>
@@ -8,6 +9,7 @@
 #include <mutex>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_dsp/juce_dsp.h>
+#include <juce_events/juce_events.h>
 
 namespace pedalboard {
 
@@ -17,7 +19,7 @@ namespace pedalboard {
 // - 50..59: Bass Cabs (Eden 1x15"/4x10", SWR, Mesa 2x10", MarkBass, Ampeg PF-115 / SVT-410 / SVT-810, Hartke)
 // - 60..69: Acoustic Body IR Simulations (Dreadnought AC/AC Dream, OM, Jumbo, H-Bird, GA, Classic, Mandolin, Fretless/Double Bass)
 // - 70:     User IR 1~20 (.wav / .aiff custom IR loader)
-class CabinetIRLoader {
+class CabinetIRLoader : private juce::AsyncUpdater {
 public:
     enum class BuiltInVoicing {
         Closed4x12 = 0,
@@ -35,8 +37,13 @@ public:
     explicit CabinetIRLoader(BuiltInVoicing defaultVoicing = BuiltInVoicing::Closed4x12)
         : voicing(defaultVoicing),
           activeModelIndex(defaultVoicing == BuiltInVoicing::Closed4x12 ? 14 : 7) {
-        const auto& entry = gp200::getModelEntry(ModuleId::CabinetIR, activeModelIndex);
+        const int initIdx = activeModelIndex.load(std::memory_order_relaxed);
+        const auto& entry = gp200::getModelEntry(ModuleId::CabinetIR, initIdx);
         displayName = juce::String(entry.name) + " (" + entry.subType + ")";
+    }
+
+    ~CabinetIRLoader() override {
+        cancelPendingUpdate();
     }
 
     void prepare(const juce::dsp::ProcessSpec& spec) {
@@ -54,7 +61,7 @@ public:
         if (existingPath.isNotEmpty() && juce::File(existingPath).existsAsFile()) {
             loadCustomIR(juce::File(existingPath));
         } else {
-            loadBuiltInSyntheticCab(activeModelIndex);
+            loadBuiltInSyntheticCab(activeModelIndex.load(std::memory_order_acquire));
         }
     }
 
@@ -75,11 +82,15 @@ public:
             0,
             juce::dsp::Convolution::Normalise::yes
         );
-        activeModelIndex = 70;
+        factoryReloadPending.store(false, std::memory_order_release);
+        requestedFactoryModel.store(70, std::memory_order_release);
+        activeModelIndex.store(70, std::memory_order_release);
         usingCustomIr.store(true, std::memory_order_release);
+        usingPackIr.store(false, std::memory_order_release);
         std::lock_guard<std::mutex> lock(pathMutex);
         customIrPath = file.getFullPathName();
         customIrName = file.getFileNameWithoutExtension();
+        packIrName.clear();
         displayName = "User IR: " + customIrName;
         return true;
     }
@@ -93,8 +104,11 @@ public:
         if (saved.isNotEmpty() && juce::File(saved).existsAsFile()) {
             return loadCustomIR(juce::File(saved));
         }
-        activeModelIndex = 70;
+        factoryReloadPending.store(false, std::memory_order_release);
+        requestedFactoryModel.store(70, std::memory_order_release);
+        activeModelIndex.store(70, std::memory_order_release);
         usingCustomIr.store(false, std::memory_order_release);
+        usingPackIr.store(false, std::memory_order_release);
         return false;
     }
 
@@ -113,9 +127,35 @@ public:
             modelIdx = (voicing == BuiltInVoicing::Closed4x12) ? 14 : 7;
         }
         modelIdx = std::clamp(modelIdx, 0, 69);
-        activeModelIndex = modelIdx;
+        factoryReloadPending.store(false, std::memory_order_release);
+        requestedFactoryModel.store(modelIdx, std::memory_order_release);
+        activeModelIndex.store(modelIdx, std::memory_order_release);
         usingCustomIr.store(false, std::memory_order_release);
+        observedRegistryVer.store(ModelPackRegistry::instance().getVersion(), std::memory_order_release);
         const auto& entry = gp200::getModelEntry(ModuleId::CabinetIR, modelIdx);
+
+        // Priority: Lazy-load real .wav/.aif IR from bundled ModelPacks.zip or %APPDATA%\PedalBoard\ModelPacks\!
+        if (auto asset = ModelPackRegistry::instance().loadCaptureBytes(entry.excelNo, true); asset.has_value()) {
+            convolution.loadImpulseResponse(
+                asset->bytes.getData(),
+                asset->bytes.getSize(),
+                juce::dsp::Convolution::Stereo::yes,
+                juce::dsp::Convolution::Trim::yes,
+                0,
+                juce::dsp::Convolution::Normalise::yes
+            );
+            usingPackIr.store(true, std::memory_order_release);
+            std::lock_guard<std::mutex> lock(pathMutex);
+            if (!preserveCustomIrPath) {
+                customIrPath.clear();
+                customIrName.clear();
+            }
+            packIrName = asset->displayName + " [" + asset->originLabel + "]";
+            displayName = juce::String(entry.name) + "  |  " + packIrName;
+            return;
+        }
+
+        usingPackIr.store(false, std::memory_order_release);
         const juce::String sub(entry.subType);
 
         constexpr int kIrLength = 1024;
@@ -237,11 +277,28 @@ public:
             customIrPath.clear();
             customIrName.clear();
         }
+        packIrName.clear();
         displayName = juce::String(entry.name) + "  |  " + entry.description;
     }
 
-    int getActiveModelIndex() const noexcept { return activeModelIndex; }
+    int getActiveModelIndex() const noexcept { return activeModelIndex.load(std::memory_order_acquire); }
     bool isUsingCustomIr() const noexcept { return usingCustomIr.load(std::memory_order_acquire); }
+    bool isUsingPackIr() const noexcept { return usingPackIr.load(std::memory_order_acquire); }
+
+    juce::String getPackIrName() const {
+        std::lock_guard<std::mutex> lock(pathMutex);
+        return packIrName;
+    }
+
+    void requestPackRefresh() {
+        observedRegistryVer.store(0, std::memory_order_release);
+        const int cur = activeModelIndex.load(std::memory_order_acquire);
+        if (cur >= 0 && cur < 70 && !usingCustomIr.load(std::memory_order_acquire)) {
+            requestedFactoryModel.store(cur, std::memory_order_release);
+            factoryReloadPending.store(true, std::memory_order_release);
+            triggerAsyncUpdate();
+        }
+    }
 
     bool hasCustomIrFile() const {
         std::lock_guard<std::mutex> lock(pathMutex);
@@ -274,10 +331,19 @@ public:
             return;
         }
 
-        // If user switched GP-200 factory cabinet model (0..69), re-voice synthetic IR while preserving any saved custom IR for instant A/B!
+        // Strictly real-time safe: if user switched GP-200 factory cabinet model (0..69)
+        // or ModelPackRegistry was rescanned, defer IR load/swap onto the Message Thread via AsyncUpdater!
         const int targetModel = std::clamp(p.modelIndex, 0, static_cast<int>(gp200::kCabModels.size()) - 1);
-        if (targetModel < 70 && (targetModel != activeModelIndex || usingCustomIr.load(std::memory_order_relaxed))) {
-            loadBuiltInSyntheticCab(targetModel, true);
+        const uint64_t regVer = ModelPackRegistry::instance().getVersion();
+        if (targetModel < 70
+            && (targetModel != activeModelIndex.load(std::memory_order_acquire)
+                || usingCustomIr.load(std::memory_order_acquire)
+                || regVer != observedRegistryVer.load(std::memory_order_acquire))) {
+            const int prevReq = requestedFactoryModel.exchange(targetModel, std::memory_order_acq_rel);
+            const bool alreadyPending = factoryReloadPending.exchange(true, std::memory_order_acq_rel);
+            if (!alreadyPending || prevReq != targetModel) {
+                triggerAsyncUpdate();
+            }
         }
 
         if (std::abs(p.lowCutHz - lastLowCut) > 0.5f || std::abs(p.highCutHz - lastHighCut) > 1.0f) {
@@ -304,6 +370,19 @@ public:
     }
 
 private:
+    void handleAsyncUpdate() override {
+        if (factoryReloadPending.exchange(false, std::memory_order_acq_rel)) {
+            const int target = requestedFactoryModel.load(std::memory_order_acquire);
+            const uint64_t regVer = ModelPackRegistry::instance().getVersion();
+            if (target >= 0 && target < 70
+                && (target != activeModelIndex.load(std::memory_order_acquire)
+                    || usingCustomIr.load(std::memory_order_acquire)
+                    || regVer != observedRegistryVer.load(std::memory_order_acquire))) {
+                loadBuiltInSyntheticCab(target, true);
+            }
+        }
+    }
+
     void updateFilters(float lowHz, float highHz) noexcept {
         lastLowCut = lowHz;
         lastHighCut = highHz;
@@ -312,7 +391,10 @@ private:
     }
 
     BuiltInVoicing voicing = BuiltInVoicing::Closed4x12;
-    int activeModelIndex = 14;
+    std::atomic<int> activeModelIndex { 14 };
+    std::atomic<int> requestedFactoryModel { -1 };
+    std::atomic<bool> factoryReloadPending { false };
+    std::atomic<uint64_t> observedRegistryVer { 0 };
     double sampleRate = 44100.0;
     float lastLowCut = -1.0f;
     float lastHighCut = -1.0f;
@@ -323,8 +405,10 @@ private:
 
     mutable std::mutex pathMutex;
     std::atomic<bool> usingCustomIr { false };
+    std::atomic<bool> usingPackIr { false };
     juce::String customIrPath;
     juce::String customIrName;
+    juce::String packIrName;
     juce::String displayName;
 };
 
