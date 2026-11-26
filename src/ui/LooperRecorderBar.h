@@ -390,6 +390,9 @@ public:
           clearBtn(DockIconButton::Glyph::ClearTrash),
           routingToggle(proc),
           waveformView(proc.getSignalChain().getLooper(), [this] { triggerLooperRecPlayDub(); }),
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+          tempDiPlayBtn(DockIconButton::Glyph::PlayTri, "DI"),
+#endif
           wavRecBtn(DockIconButton::Glyph::RecDot, "WAV"),
           wavFolderBtn(DockIconButton::Glyph::Folder) {
         recPlayDubBtn.setTooltip("Looper: Record -> Play -> Overdub (Space)");
@@ -449,6 +452,33 @@ public:
             processor.getSignalChain().getRecorder().getRecordingsDirectory().revealToUser();
         };
         addAndMakeVisible(wavFolderBtn);
+
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+        tempDiPlayBtn.setTooltip("Temporary Clean Guitar DI Sample Player (feeds directly into SignalChain input)");
+        tempDiPlayBtn.onClick = [this] {
+            processor.getSignalChain().getTempDiPlayer().togglePlay();
+            refreshLiveState();
+        };
+        addAndMakeVisible(tempDiPlayBtn);
+
+        tempDiRhythmBtn.setButtonText("RHY");
+        tempDiRhythmBtn.setTooltip("Test Sample 1: Electric Guitar Rhythm Clean");
+        tempDiRhythmBtn.setMouseCursor(juce::MouseCursor::PointingHandCursor);
+        tempDiRhythmBtn.onClick = [this] {
+            processor.getSignalChain().getTempDiPlayer().selectTrack(TempDiSamplePlayer::Track::Rhythm);
+            refreshLiveState();
+        };
+        addAndMakeVisible(tempDiRhythmBtn);
+
+        tempDiSoloBtn.setButtonText("SOLO");
+        tempDiSoloBtn.setTooltip("Test Sample 2: Clean Guitar Solo");
+        tempDiSoloBtn.setMouseCursor(juce::MouseCursor::PointingHandCursor);
+        tempDiSoloBtn.onClick = [this] {
+            processor.getSignalChain().getTempDiPlayer().selectTrack(TempDiSamplePlayer::Track::Solo);
+            refreshLiveState();
+        };
+        addAndMakeVisible(tempDiSoloBtn);
+#endif
 
         refreshLiveState();
     }
@@ -538,6 +568,31 @@ public:
 
         wavFolderBtn.setVisualState(DockIconButton::Glyph::Folder, {}, juce::Colours::transparentBlack,
                                     juce::Colour(0xff8e9bb2), juce::Colour(0xffcbd5e1));
+
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+        auto& di = processor.getSignalChain().getTempDiPlayer();
+        di.reclaimRetired();
+        const bool diPlaying = di.isPlaying();
+        const bool isSolo = (di.getSelectedTrack() == TempDiSamplePlayer::Track::Solo);
+        if (diPlaying) {
+            tempDiPlayBtn.setVisualState(DockIconButton::Glyph::StopSq, "DI",
+                                         juce::Colour(0xff0e7490), juce::Colours::white, juce::Colours::white);
+        } else {
+            tempDiPlayBtn.setVisualState(DockIconButton::Glyph::PlayTri, "DI",
+                                         juce::Colour(0xff181d28), juce::Colour(0xff9aa6bc), juce::Colour(0xffcbd5e1));
+        }
+
+        auto styleSeg = [&](juce::TextButton& b, bool sel) {
+            b.setColour(juce::TextButton::buttonColourId,
+                        sel ? (diPlaying ? juce::Colour(0xff155e75) : juce::Colour(0xff232b3a))
+                            : juce::Colour(0xff0d1118));
+            b.setColour(juce::TextButton::textColourOffId,
+                        sel ? (diPlaying ? juce::Colour(0xffe0f2fe) : juce::Colour(0xffcbd5e1))
+                            : juce::Colour(0xff64748b));
+        };
+        styleSeg(tempDiRhythmBtn, !isSolo);
+        styleSeg(tempDiSoloBtn, isSolo);
+#endif
         repaint();
     }
 
@@ -583,6 +638,19 @@ public:
         // Architectural hairline divider before WAV Recorder
         g.setColour(juce::Colour(0xff212836));
         g.drawVerticalLine(recorderDividerX, 9.0f, bounds.getHeight() - 9.0f);
+
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+        if (!tempDiCapsuleRect.isEmpty()) {
+            const bool diOn = processor.getSignalChain().getTempDiPlayer().isPlaying();
+            auto dr = tempDiCapsuleRect.toFloat();
+            g.setColour(juce::Colour(0xff0a0d13));
+            g.fillRoundedRectangle(dr, 5.5f);
+            g.setColour(diOn ? juce::Colour(0xff06b6d4).withAlpha(0.75f) : juce::Colour(0xff232b3a));
+            g.drawRoundedRectangle(dr, 5.5f, 1.0f);
+            g.setColour(juce::Colour(0xff1e2533));
+            g.drawVerticalLine(tempDiPlayBtn.getRight(), dr.getY() + 4.0f, dr.getBottom() - 4.0f);
+        }
+#endif
 
         // 3. Unified 24-bit WAV Recorder Capsule
         if (!wavCapsuleRect.isEmpty()) {
@@ -673,6 +741,19 @@ public:
         recorderDividerX = area.getRight();
         area.removeFromRight(compact ? 8 : 10);
 
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+        const int diW = compact ? 118 : 132;
+        tempDiCapsuleRect = area.removeFromRight(diW).withSizeKeepingCentre(diW, pillH);
+        {
+            auto dIn = tempDiCapsuleRect;
+            tempDiPlayBtn.setBounds(dIn.removeFromLeft(compact ? 44 : 48));
+            const int half = dIn.getWidth() / 2;
+            tempDiRhythmBtn.setBounds(dIn.removeFromLeft(half).reduced(1, 2));
+            tempDiSoloBtn.setBounds(dIn.reduced(1, 2));
+        }
+        area.removeFromRight(compact ? 6 : 8);
+#endif
+
         // Looper Level Trim Knob + micro-label
         const int knobSz = std::min(shortBar ? 30 : 34, ctrlH + 2);
         auto kBox = area.removeFromRight(knobSz);
@@ -707,6 +788,12 @@ private:
 
     DockIconButton wavRecBtn;
     DockIconButton wavFolderBtn;
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+    juce::Rectangle<int> tempDiCapsuleRect;
+    DockIconButton tempDiPlayBtn;
+    juce::TextButton tempDiRhythmBtn;
+    juce::TextButton tempDiSoloBtn;
+#endif
 };
 
 } // namespace pedalboard

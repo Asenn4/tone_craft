@@ -11,6 +11,7 @@
 #include "../dsp/ReverbUnit.h"
 #include "../dsp/StereoChorus.h"
 #include "../dsp/StereoDelay.h"
+#include "../dsp/TempDiSamplePlayer.h"
 #include "../dsp/WahStomp.h"
 #include "ModuleId.h"
 #include "PedalSlot.h"
@@ -123,6 +124,9 @@ public:
         }
         looper.prepare(sr);
         recorder.prepare(sr);
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+        tempDiPlayer.prepare(sr);
+#endif
 
         smoothedInGain.reset(sr, 0.015);
         smoothedOutGain.reset(sr, 0.015);
@@ -191,6 +195,11 @@ public:
         if (numSamples <= 0 || numChannels <= 0) {
             return;
         }
+
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+        // TEMPORARY: Inject clean DI guitar loop at very front of chain before Input Gain/Tuner/Effects/Amp/Cab
+        tempDiPlayer.injectIfPlaying(buffer);
+#endif
 
         // Guitar Input Channel Routing (Mono Ch 1 / Ch 2 / Sum Mono / Stereo)
         if (numChannels >= 2) {
@@ -722,6 +731,11 @@ public:
     WavAudioRecorder& getRecorder() noexcept { return recorder; }
     const WavAudioRecorder& getRecorder() const noexcept { return recorder; }
 
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+    TempDiSamplePlayer& getTempDiPlayer() noexcept { return tempDiPlayer; }
+    const TempDiSamplePlayer& getTempDiPlayer() const noexcept { return tempDiPlayer; }
+#endif
+
     float getInputPeakL() const noexcept { return inputPeakL.load(std::memory_order_relaxed); }
     float getInputPeakR() const noexcept { return inputPeakR.load(std::memory_order_relaxed); }
     float getOutputPeakL() const noexcept { return outputPeakL.load(std::memory_order_relaxed); }
@@ -868,6 +882,9 @@ private:
     std::array<UniversalPedalSlotDsp, kMaxPedalSlots> customSlotDsps {};
     StereoLooper looper;
     WavAudioRecorder recorder;
+#if defined(PEDALBOARD_TEMP_DI_TESTER) && PEDALBOARD_TEMP_DI_TESTER
+    TempDiSamplePlayer tempDiPlayer;
+#endif
 
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> smoothedInGain;
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> smoothedOutGain;

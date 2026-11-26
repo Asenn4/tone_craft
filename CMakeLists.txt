@@ -154,6 +154,9 @@ target_compile_definitions(PedalBoard
         JUCE_USE_CURL=0
         JUCE_VST3_CAN_REPLACE_VST2=0
         JUCE_STRICT_REFCOUNTEDPOINTER=1
+        # TEMPORARY Clean Guitar DI Sample Tester (set to 0 and delete TempDiSamplePlayer.h + test_audio/ when no longer needed!)
+        PEDALBOARD_TEMP_DI_TESTER=1
+        PEDALBOARD_TEMP_DI_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test_audio"
 )
 
 if(PEDALBOARD_ASIO_COMMON_DIR)
